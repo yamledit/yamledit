@@ -3,6 +3,7 @@ package yamledit
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -3811,4 +3812,69 @@ func TestSetScalarInsideSequenceItem(t *testing.T) {
 	if !strings.Contains(string(out), "name: new") {
 		t.Errorf("Scalar update inside sequence failed to persist.\nOutput:\n%s", string(out))
 	}
+}
+
+func TestJSONPatchAdd(t *testing.T) {
+	yamlData := []byte(`apiVersion: v1
+kind: Test
+metadata:
+  name: test
+  annotations:
+    foo: bar
+spec:
+  environment: dev
+  version: 1.0.0
+`)
+
+	doc, err := Parse(yamlData)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Test 1: Add a simple key-value to spec
+	patch1 := []map[string]interface{}{
+		{
+			"op":    "add",
+			"path":  "/newKey",
+			"value": "newValue",
+		},
+	}
+	patchJSON1, _ := json.Marshal(patch1)
+	fmt.Printf("Patch 1: %s\n", patchJSON1)
+
+	if err := ApplyJSONPatchAtPathBytes(doc, patchJSON1, []string{"spec"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes error: %v", err)
+	}
+
+	result1, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	fmt.Printf("After patch 1:\n%s\n", result1)
+
+	// Test 2: Add a nested object
+	doc2, _ := Parse(yamlData)
+	patch2 := []map[string]interface{}{
+		{
+			"op":   "add",
+			"path": "/argoCd",
+			"value": map[string]interface{}{
+				"rbac": map[string]interface{}{
+					"additionalAdminGroups": []string{"group1", "group2"},
+				},
+			},
+		},
+	}
+	patchJSON2, _ := json.Marshal(patch2)
+	fmt.Printf("Patch 2: %s\n", patchJSON2)
+
+	if err := ApplyJSONPatchAtPathBytes(doc2, patchJSON2, []string{"spec"}); err != nil {
+		t.Fatalf("ApplyJSONPatchAtPathBytes error for patch2: %v", err)
+	}
+
+	result2, err := Marshal(doc2)
+	if err != nil {
+		t.Fatalf("Marshal error for patch2: %v", err)
+	}
+	fmt.Printf("After patch 2:\n%s\n", result2)
 }

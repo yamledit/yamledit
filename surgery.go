@@ -1530,6 +1530,39 @@ func buildInsertPatches(
 			}
 			switch v := it.Value.(type) {
 			case gyaml.MapSlice:
+				mi := mapIdx[mpath]
+				// If this key is NEW and its value is a mapping, we must insert the *entire*
+				// mapping block at the parent mapping. Walking into it would require anchors
+				// for a mapping path that does not exist in the original byte stream.
+				if _, existed := origKeys[mpath][k]; !existed {
+					if mi == nil || !mi.originalPath || !mi.hasAnyKey {
+						return false
+					}
+					insertPos := mi.lastLineEnd + 1
+					if insertPos < 0 {
+						insertPos = len(original)
+					}
+					indent := mi.indent
+					if indent == 0 && len(path) > 0 {
+						indent = baseIndent * len(path)
+					}
+
+					var sb strings.Builder
+					if mi.lastLineEnd >= len(original) || (mi.lastLineEnd >= 0 && mi.lastLineEnd < len(original) && original[mi.lastLineEnd] != '\n') {
+						sb.WriteString("\n")
+					}
+					if !renderInsertedKeyValue(&sb, k, v, indent, baseIndent) {
+						return false
+					}
+
+					patches = append(patches, patch{
+						start: insertPos,
+						end:   insertPos,
+						data:  []byte(sb.String()),
+					})
+					continue
+				}
+
 				if !walk(v, append(path, k)) {
 					return false
 				}
@@ -1831,4 +1864,133 @@ func buildDeletionPatches(original []byte, deletions map[string]struct{}, bounds
 	return true, patches
 }
 
-// ----- Small utilities for indices and scanning -----
+// renderInsertedKeyValue renders a conservative block-style YAML snippet for inserting a NEW key.
+// It is used by surgical insertion when a new key's value is a mapping/sequence/scalar.
+func renderInsertedKeyValue(sb *strings.Builder, key string, val interface{}, indent, baseIndent int) bool {
+	writeIndent := func(n int) {
+		if n > 0 {
+			sb.WriteString(strings.Repeat(" ", n))
+		}
+	}
+
+	renderScalar := func(v interface{}) (string, bool) {
+		switch vv := v.(type) {
+		case nil:
+			return "null", true
+		case bool:
+			if vv {
+				return "true", true
+			}
+			return "false", true
+		case int:
+			return strconv.Itoa(vv), true
+		case int64:
+			return strconv.FormatInt(vv, 10), true
+		case float64:
+			return strconv.FormatFloat(vv, 'f', -1, 64), true
+		case string:
+			if isSafeBareString(vv) {
+				return vv, true
+			}
+			return quoteNewStringToken(vv), true
+		default:
+			return fmt.Sprint(vv), true
+		}
+	}
+
+	var renderValue func(v interface{}, nextIndent int) bool
+	renderValue = func(v interface{}, nextIndent int) bool {
+		switch vv := v.(type) {
+		case gyaml.MapSlice:
+			if len(vv) == 0 {
+				sb.WriteString(" {}\n")
+				return true
+			}
+			sb.WriteString("\n")
+			for _, it := range vv {
+				k, ok := it.Key.(string)
+				if !ok {
+					continue
+				}
+				writeIndent(nextIndent)
+				sb.WriteString(k)
+				sb.WriteString(":")
+				if !renderValue(it.Value, nextIndent+baseIndent) {
+					return false
+				}
+			}
+			return true
+
+		case []interface{}:
+			if len(vv) == 0 {
+				sb.WriteString(" []\n")
+				return true
+			}
+			sb.WriteString("\n")
+			itemIndent := nextIndent
+			for _, elem := range vv {
+				writeIndent(itemIndent)
+				sb.WriteString("-")
+				switch ev := elem.(type) {
+				case gyaml.MapSlice:
+					if len(ev) == 0 {
+						sb.WriteString(" {}\n")
+						continue
+					}
+					sb.WriteString("\n")
+					for _, mit := range ev {
+						mk, ok := mit.Key.(string)
+						if !ok {
+							continue
+						}
+						writeIndent(itemIndent + baseIndent)
+						sb.WriteString(mk)
+						sb.WriteString(":")
+						if !renderValue(mit.Value, itemIndent+2*baseIndent) {
+							return false
+						}
+					}
+				case []interface{}:
+					// best-effort nested sequence
+					if len(ev) == 0 {
+						sb.WriteString(" []\n")
+						continue
+					}
+					sb.WriteString("\n")
+					for _, ne := range ev {
+						writeIndent(itemIndent + baseIndent)
+						sb.WriteString("-")
+						s, _ := renderScalar(ne)
+						sb.WriteString(" ")
+						sb.WriteString(s)
+						sb.WriteString("\n")
+					}
+				default:
+					s, ok := renderScalar(ev)
+					if !ok {
+						return false
+					}
+					sb.WriteString(" ")
+					sb.WriteString(s)
+					sb.WriteString("\n")
+				}
+			}
+			return true
+
+		default:
+			s, ok := renderScalar(vv)
+			if !ok {
+				return false
+			}
+			sb.WriteString(" ")
+			sb.WriteString(s)
+			sb.WriteString("\n")
+			return true
+		}
+	}
+
+	writeIndent(indent)
+	sb.WriteString(key)
+	sb.WriteString(":")
+	return renderValue(val, indent+baseIndent)
+}

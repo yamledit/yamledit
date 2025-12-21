@@ -188,18 +188,18 @@ func orderedValueAt(ms gyaml.MapSlice, path []string, key string) (interface{}, 
 }
 
 func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, baseIndent int) (string, bool) {
-	plain := toPlain(val)
-
-	var tmp bytes.Buffer
-	enc := yaml.NewEncoder(&tmp)
-	enc.SetIndent(baseIndent)
-	if err := enc.Encode(map[string]interface{}{key: plain}); err != nil {
-		_ = enc.Close()
+	// IMPORTANT: do NOT convert to map[string]interface{} (it loses key order).
+	// Build a yaml.Node mapping and encode that (preserves gyaml.MapSlice order).
+	root := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	root.Content = append(root.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		orderedToYAMLNode(val),
+	)
+	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
+	lines, ok := encodeNodeLines(doc, baseIndent)
+	if !ok {
 		return "", false
 	}
-	_ = enc.Close()
-
-	lines := strings.Split(strings.TrimRight(tmp.String(), "\n"), "\n")
 	indentSpaces := currentIndent(original, b.start)
 	prefix := strings.Repeat(" ", indentSpaces)
 	comment := inlineComment(original, b.start)
@@ -312,9 +312,64 @@ func renderSequenceValue(original []byte, key string, val interface{}, b kvBound
 		return sb.String(), true
 	}
 	sb.WriteString(":\n")
+
+	// dashIndent is where "- " starts for items under this key.
+	dashIndent := indentSpaces + baseIndent
+	// continuationIndent aligns subsequent lines under the first key after "- ".
+	continuationIndent := dashIndent + 2
+
+	isMapLike := func(v interface{}) bool {
+		switch v.(type) {
+		case gyaml.MapSlice, map[string]interface{}, map[interface{}]interface{}:
+			return true
+		default:
+			return false
+		}
+	}
+
+	encodeAsLines := func(v interface{}) ([]string, bool) {
+		// IMPORTANT: do NOT call toPlain(v) here, it destroys gyaml.MapSlice ordering
+		// and the yaml encoder will reorder keys (your exact bug).
+		n := orderedToYAMLNode(v)
+		// yaml encoder prefers DocumentNode; strip '---' if any.
+		doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{n}}
+		return encodeNodeLines(doc, baseIndent)
+	}
+
 	for _, el := range arr {
+		// If the element is a mapping, render it as a proper YAML list item
+		// instead of going through renderScalarLine (which produces "- key/value" noise).
+		if isMapLike(el) {
+			lines, ok := encodeAsLines(el)
+			if !ok {
+				return "", false
+			}
+			if len(lines) == 0 {
+				// empty map -> "- {}"
+				sb.WriteString(strings.Repeat(" ", dashIndent))
+				sb.WriteString("- {}")
+				sb.WriteString("\n")
+				continue
+			}
+
+			// First line gets the dash.
+			sb.WriteString(strings.Repeat(" ", dashIndent))
+			sb.WriteString("- ")
+			sb.WriteString(lines[0])
+			sb.WriteString("\n")
+
+			// Subsequent lines align under the first key (2 spaces after dashIndent).
+			for i := 1; i < len(lines); i++ {
+				sb.WriteString(strings.Repeat(" ", continuationIndent))
+				sb.WriteString(lines[i])
+				sb.WriteString("\n")
+			}
+			continue
+		}
+
+		// Scalar item: keep existing behavior.
 		line := renderScalarLine(el)
-		sb.WriteString(strings.Repeat(" ", indentSpaces+baseIndent))
+		sb.WriteString(strings.Repeat(" ", dashIndent))
 		sb.WriteString("- ")
 		sb.WriteString(line)
 		sb.WriteString("\n")

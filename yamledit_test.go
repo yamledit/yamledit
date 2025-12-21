@@ -3328,7 +3328,7 @@ func TestRemovingAllArrayItemsLeavesEmptyArray(t *testing.T) {
 	]`)
 	err = ApplyJSONPatchAtPathBytes(doc, patch, []string{"app-chart", "secretsList"})
 	require.NoError(t, err)
-
+	//
 	out, err := Marshal(doc)
 	require.NoError(t, err)
 	s := string(out)
@@ -3877,4 +3877,91 @@ spec:
 		t.Fatalf("Marshal error for patch2: %v", err)
 	}
 	fmt.Printf("After patch 2:\n%s\n", result2)
+}
+
+func TestJSONPatch_ArrayOfMaps_PreservesMappingStyle(t *testing.T) {
+	yamlInput := `
+pipelineName: old-name
+pipelineConfig:
+  pipelineProcess:
+    - processName: process-1
+      plugin:
+        name: flinkstream
+`
+	doc, err := Parse([]byte(yamlInput))
+	require.NoError(t, err)
+
+	// Applying a patch to a deep element in a list of maps
+	patches := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/pipelineConfig/pipelineProcess/0/plugin/name",
+			"value": "new-plugin-name",
+		},
+	}
+	patchJSON, err := json.Marshal(patches)
+	require.NoError(t, err)
+
+	err = ApplyJSONPatchBytes(doc, patchJSON)
+	require.NoError(t, err)
+
+	output, err := Marshal(doc)
+	require.NoError(t, err)
+
+	actualStr := string(output)
+
+	// Check that the output does NOT contain the corrupted "key/value" sequence style
+	assert.NotContains(t, actualStr, "- key: processName", "Output should not be converted to a key/value sequence")
+
+	// Check that it DOES contain the expected mapping style
+	assert.Contains(t, actualStr, "processName: process-1", "Output should maintain original mapping style")
+	assert.Contains(t, actualStr, "name: new-plugin-name", "Output should contain the updated value in mapping style")
+}
+
+func TestKeyOrderingPreservation(t *testing.T) {
+	yamlInput := `
+pipelineProcess:
+  - processName: ods_stream
+    plugin:
+      name: flinkstream
+      type: TRANSFORM
+      label: flinkstream
+      properties:
+        dataStreamName: ods_stream
+        format: debezium
+        groupId: search-uam-role-acl-join-hk-11-19
+        autoOffsetReset: latest
+`
+	doc, err := Parse([]byte(yamlInput))
+	require.NoError(t, err)
+
+	patches := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/pipelineProcess/0/plugin/properties/groupId",
+			"value": "t0-search-uam-role-acl-join-hk-staging-0910-20251221",
+		},
+	}
+	patchJSON, err := json.Marshal(patches)
+	require.NoError(t, err)
+
+	err = ApplyJSONPatchBytes(doc, patchJSON)
+	require.NoError(t, err)
+
+	output, err := Marshal(doc)
+	require.NoError(t, err)
+
+	actualStr := string(output)
+
+	// Check if processName is still BEFORE plugin
+	processNameIdx := strings.Index(actualStr, "processName: ods_stream")
+	pluginIdx := strings.Index(actualStr, "plugin:")
+
+	assert.True(t, processNameIdx < pluginIdx, "processName should appear before plugin to preserve original ordering")
+
+	// Check if name is before type inside plugin
+	nameIdx := strings.Index(actualStr, "name: flinkstream")
+	typeIdx := strings.Index(actualStr, "type: TRANSFORM")
+
+	assert.True(t, nameIdx < typeIdx, "name should appear before type inside plugin to preserve original ordering")
 }

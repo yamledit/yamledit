@@ -3965,3 +3965,95 @@ pipelineProcess:
 
 	assert.True(t, nameIdx < typeIdx, "name should appear before type inside plugin to preserve original ordering")
 }
+
+func TestScalarChurnRepro(t *testing.T) {
+	yamlInput := `
+pipelineProcess:
+  - processName: mutation
+    plugin:
+      properties:
+        groupId: old-id
+        parameters: >
+          {
+            "json": "value"
+          }
+`
+	doc, err := Parse([]byte(yamlInput))
+	require.NoError(t, err)
+
+	// Apply a patch to a sibling field
+	patches := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/pipelineProcess/0/plugin/properties/groupId",
+			"value": "new-id",
+		},
+	}
+	patchJSON, err := json.Marshal(patches)
+	require.NoError(t, err)
+
+	err = ApplyJSONPatchBytes(doc, patchJSON)
+	require.NoError(t, err)
+
+	output, err := Marshal(doc)
+	require.NoError(t, err)
+
+	actualStr := string(output)
+
+	// 1. Check if scalar style changed (from > to |)
+	assert.Contains(t, actualStr, "parameters: >", "Should preserve folded scalar style (>)")
+	assert.NotContains(t, actualStr, "parameters: |", "Should not convert to literal scalar style (|)")
+
+	// 2. Check for duplication bug
+	count := strings.Count(actualStr, "\"json\": \"value\"")
+	assert.Equal(t, 1, count, "Content should not be duplicated after a sibling patch")
+}
+
+func TestScalarStylePreservation(t *testing.T) {
+	yamlInput := `
+pipelineName: old-name
+pipelineProcess:
+  - processName: mutation
+    plugin:
+      properties:
+        parameters: >
+          {
+            "json": "value"
+          }
+`
+	doc, err := Parse([]byte(yamlInput))
+	require.NoError(t, err)
+
+	patches := []map[string]interface{}{
+		{
+			"op":    "replace",
+			"path":  "/pipelineName",
+			"value": "new-name",
+		},
+	}
+	patchJSON, err := json.Marshal(patches)
+	require.NoError(t, err)
+
+	err = ApplyJSONPatchBytes(doc, patchJSON)
+	require.NoError(t, err)
+
+	output, err := Marshal(doc)
+	require.NoError(t, err)
+
+	actualStr := string(output)
+
+	// Check if parameters still uses '>' style
+	assert.Contains(t, actualStr, "parameters: >", "Should preserve folded scalar style ( M>)")
+	assert.NotContains(t, actualStr, "parameters: |", "Should not convert to literal scalar style ( M|)")
+
+	// Check for the injection bug I saw earlier
+	lines := strings.Split(actualStr, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "pipelineName: new-name") {
+			// Ensure it's not preceded by 'parameters: >' on the same or previous line if it was broken
+			if i > 0 && strings.Contains(lines[i-1], "parameters: >") {
+				t.Errorf("Detected injection bug: pipelineName found right after parameters: >")
+			}
+		}
+	}
+}

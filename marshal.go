@@ -76,7 +76,7 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		patched[pk] = struct{}{}
 	}
 
-	changed := collectChangedKeys(origOrdered, ordered, nil)
+	changed := collectChangedKeysDeep(origOrdered, ordered, nil)
 	for _, pk := range changed {
 		if _, skip := patched[pk]; skip {
 			continue
@@ -163,28 +163,65 @@ func splitPathKey(pk string) ([]string, string) {
 }
 
 func orderedValueAt(ms gyaml.MapSlice, path []string, key string) (interface{}, bool) {
-	cur := ms
+	parseIdx := func(seg string) (int, bool) {
+		if len(seg) > 2 && seg[0] == '[' && seg[len(seg)-1] == ']' {
+			i, err := strconv.Atoi(seg[1 : len(seg)-1])
+			if err == nil {
+				return i, true
+			}
+		}
+		return 0, false
+	}
+
+	var cur interface{} = ms
 	for _, seg := range path {
-		found := false
-		for _, it := range cur {
-			if keyEquals(it.Key, seg) {
-				if sub, ok := it.Value.(gyaml.MapSlice); ok {
-					cur = sub
+		if idx, ok := parseIdx(seg); ok {
+			arr, okArr := cur.([]interface{})
+			if !okArr || idx < 0 || idx >= len(arr) {
+				return nil, false
+			}
+			cur = arr[idx]
+			continue
+		}
+
+		switch m := cur.(type) {
+		case gyaml.MapSlice:
+			found := false
+			for _, it := range m {
+				if keyEquals(it.Key, seg) {
+					cur = it.Value
 					found = true
 					break
 				}
 			}
-		}
-		if !found {
+			if !found {
+				return nil, false
+			}
+		case map[string]interface{}:
+			v, ok := m[seg]
+			if !ok {
+				return nil, false
+			}
+			cur = v
+		default:
 			return nil, false
 		}
 	}
-	for _, it := range cur {
-		if keyEquals(it.Key, key) {
-			return it.Value, true
+
+	switch m := cur.(type) {
+	case gyaml.MapSlice:
+		for _, it := range m {
+			if keyEquals(it.Key, key) {
+				return it.Value, true
+			}
 		}
+		return nil, false
+	case map[string]interface{}:
+		v, ok := m[key]
+		return v, ok
+	default:
+		return nil, false
 	}
-	return nil, false
 }
 
 func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, baseIndent int) (string, bool) {
@@ -246,34 +283,91 @@ func inlineComment(original []byte, start int) string {
 	return ""
 }
 
-func collectChangedKeys(orig gyaml.MapSlice, cur gyaml.MapSlice, path []string) []string {
-	var out []string
-	for _, it := range cur {
-		k, ok := it.Key.(string)
-		if !ok {
-			continue
-		}
-		ov, okOrig := findLast(orig, k)
-		cv := it.Value
-		diff := !okOrig || !reflect.DeepEqual(toPlain(ov), toPlain(cv))
-		if subCur, ok := cv.(gyaml.MapSlice); ok {
-			if diff {
-				if ovMs, okMs := ov.(gyaml.MapSlice); !okMs || len(subCur) == 0 || len(ovMs) == 0 {
-					out = append(out, makePathKey(path, k))
-				}
-			}
-			var subOrig gyaml.MapSlice
-			if ovMs, ok := ov.(gyaml.MapSlice); ok {
-				subOrig = ovMs
-			}
-			out = append(out, collectChangedKeys(subOrig, subCur, append(path, k))...)
-			continue
-		}
-		if diff {
-			out = append(out, makePathKey(path, k))
+func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []string {
+	isMapLike := func(v interface{}) bool {
+		switch v.(type) {
+		case gyaml.MapSlice, map[string]interface{}, map[interface{}]interface{}:
+			return true
+		default:
+			return false
 		}
 	}
-	return out
+	appendSeg := func(base []string, seg string) []string {
+		out := append([]string(nil), base...)
+		return append(out, seg)
+	}
+
+	switch c := cur.(type) {
+	case gyaml.MapSlice:
+		var o gyaml.MapSlice
+		if om, ok := orig.(gyaml.MapSlice); ok {
+			o = om
+		}
+		var out []string
+		for _, it := range c {
+			k, ok := it.Key.(string)
+			if !ok {
+				continue
+			}
+			ov, okOrig := findLast(o, k)
+			cv := it.Value
+
+			// Recurse into nested mappings.
+			if subCur, ok := cv.(gyaml.MapSlice); ok {
+				// Preserve the old behavior for map shape transitions.
+				if !okOrig || !reflect.DeepEqual(toPlain(ov), toPlain(cv)) {
+					if ovMs, okMs := ov.(gyaml.MapSlice); !okMs || len(subCur) == 0 || len(ovMs) == 0 {
+						out = append(out, makePathKey(path, k))
+					}
+				}
+				out = append(out, collectChangedKeysDeep(ov, subCur, appendSeg(path, k))...)
+				continue
+			}
+
+			// Recurse into sequences when possible (arrays of maps).
+			if curArr, ok := cv.([]interface{}); ok {
+				origArr, okArr := ov.([]interface{})
+				if !okOrig || !okArr {
+					out = append(out, makePathKey(path, k))
+					continue
+				}
+				// Length changes => rewrite the whole sequence key.
+				if len(curArr) != len(origArr) {
+					out = append(out, makePathKey(path, k))
+					continue
+				}
+
+				// Same length: if elements are maps, diff inside them by index.
+				// If we hit scalar/mixed/unknown changes, fall back to rewriting the whole sequence key.
+				needWholeSeqRewrite := false
+				for i := 0; i < len(curArr); i++ {
+					oel := origArr[i]
+					cel := curArr[i]
+					if isMapLike(oel) && isMapLike(cel) {
+						p2 := appendSeg(appendSeg(path, k), indexSeg(i))
+						out = append(out, collectChangedKeysDeep(oel, cel, p2)...)
+						continue
+					}
+					if !reflect.DeepEqual(toPlain(oel), toPlain(cel)) {
+						needWholeSeqRewrite = true
+						break
+					}
+				}
+				if needWholeSeqRewrite {
+					out = append(out, makePathKey(path, k))
+				}
+				continue
+			}
+
+			// Scalars / non-container values.
+			if !okOrig || !reflect.DeepEqual(toPlain(ov), toPlain(cv)) {
+				out = append(out, makePathKey(path, k))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func findLast(ms gyaml.MapSlice, key string) (interface{}, bool) {

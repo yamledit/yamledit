@@ -151,6 +151,13 @@ func Parse(data []byte) (*yaml.Node, error) {
 		}
 	}
 
+	// Build a fine-grained bounds index for every mapping entry at every nesting level,
+	// including mapping entries inside sequences. This is what allows structuralRewrite
+	// to patch ONLY the changed key (e.g. groupId) without re-encoding sibling block scalars.
+	if len(data) > 0 {
+		st.boundsByPathKey = indexBoundsByPathKeyDeep(st.original, doc)
+	}
+
 	register(doc, st)
 	return doc, nil
 }

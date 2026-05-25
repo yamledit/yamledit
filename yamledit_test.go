@@ -204,6 +204,42 @@ func TestApplyJSONPatchArrayReplaceMinimalDiff(t *testing.T) {
 	}
 }
 
+func TestApplyJSONPatchInsertsSequenceMapItemCompactly(t *testing.T) {
+	original := `service:
+  metadata:
+    owner: platform
+`
+
+	doc, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	patch := mustDecodePatch(t, `[
+		{"op":"add","path":"/service/policy","value":{
+				"enabled":true,
+				"name":"read-access",
+				"bindings":[{"roles":["viewer"],"identity":"reader"}]
+		}}
+	]`)
+	if err := ApplyJSONPatch(doc, patch); err != nil {
+		t.Fatalf("ApplyJSONPatch: %v", err)
+	}
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	got := string(out)
+	want := "bindings:\n      - identity: reader\n        roles:\n          - viewer"
+	if !strings.Contains(got, want) {
+		t.Fatalf("expected compact sequence mapping %q, got:\n%s", want, got)
+	}
+	if strings.Contains(got, "bindings:\n      -\n        identity: reader") {
+		t.Fatalf("did not expect standalone dash sequence mapping, got:\n%s", got)
+	}
+}
+
 // --- helpers for tests ---
 
 // findMapNode walks a mapping node by a sequence of scalar keys and returns the final mapping value node.

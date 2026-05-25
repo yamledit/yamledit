@@ -1937,18 +1937,26 @@ func renderInsertedKeyValue(sb *strings.Builder, key string, val interface{}, in
 						sb.WriteString(" {}\n")
 						continue
 					}
-					sb.WriteString("\n")
+					first := true
 					for _, mit := range ev {
 						mk, ok := mit.Key.(string)
 						if !ok {
 							continue
 						}
-						writeIndent(itemIndent + baseIndent)
+						if first {
+							sb.WriteString(" ")
+						} else {
+							writeIndent(itemIndent + baseIndent)
+						}
 						sb.WriteString(mk)
 						sb.WriteString(":")
 						if !renderValue(mit.Value, itemIndent+2*baseIndent) {
 							return false
 						}
+						first = false
+					}
+					if first {
+						sb.WriteString(" {}\n")
 					}
 				case []interface{}:
 					// best-effort nested sequence

@@ -46,6 +46,115 @@ func TestEnsurePathAndSetScalarIntOnExistingNestedMap(t *testing.T) {
 	}
 }
 
+func TestSetMapValuesWritesNestedMapsAndSequences(t *testing.T) {
+	doc, err := Parse(nil)
+	require.NoError(t, err)
+
+	spec := EnsurePath(doc, "spec")
+	SetMapValues(spec, map[string]any{
+		"empty":              "",
+		"enableForceDestroy": false,
+		"permissions":        []string{"storage.objects.get", "storage.objects.list"},
+		"workloadIdentity": []any{
+			map[string]any{
+				"project":        "tp-nonprod-84cfda6b",
+				"namespace":      "fileservice",
+				"serviceAccount": "fileservice",
+			},
+		},
+	}, SetValueOptions{DeleteEmptyStrings: true, SortKeys: true})
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.NotContains(t, string(out), "empty:")
+	require.Contains(t, string(out), "enableForceDestroy: false")
+	require.Contains(t, string(out), "permissions:")
+	require.Contains(t, string(out), "- storage.objects.get")
+	require.Contains(t, string(out), "workloadIdentity:")
+	require.Contains(t, string(out), "project: tp-nonprod-84cfda6b")
+
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+	specMap := parsed["spec"].(map[string]any)
+	require.Equal(t, false, specMap["enableForceDestroy"])
+	require.Len(t, specMap["permissions"], 2)
+	require.Len(t, specMap["workloadIdentity"], 1)
+}
+
+func TestSetValueEmptyStringPolicy(t *testing.T) {
+	doc, err := Parse([]byte("root:\n  keep: value\n  empty: old\n"))
+	require.NoError(t, err)
+	root := EnsurePath(doc, "root")
+
+	SetValue(root, "empty", "", SetValueOptions{})
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+
+	var parsed map[string]map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+	require.Contains(t, parsed["root"], "empty")
+	require.Equal(t, "", parsed["root"]["empty"])
+
+	SetValue(root, "empty", "", SetValueOptions{DeleteEmptyStrings: true})
+	out, err = Marshal(doc)
+	require.NoError(t, err)
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+	require.NotContains(t, parsed["root"], "empty")
+	require.Equal(t, "value", parsed["root"]["keep"])
+}
+
+func TestSetValueNilDeletesExistingKey(t *testing.T) {
+	doc, err := Parse([]byte("root:\n  remove: value\n  keep: value\n"))
+	require.NoError(t, err)
+	root := EnsurePath(doc, "root")
+
+	SetValue(root, "remove", nil, SetValueOptions{})
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+
+	var parsed map[string]map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+	require.NotContains(t, parsed["root"], "remove")
+	require.Equal(t, "value", parsed["root"]["keep"])
+}
+
+func TestSetStringMapValuesCanSortKeys(t *testing.T) {
+	doc, err := Parse(nil)
+	require.NoError(t, err)
+	labels := EnsurePath(doc, "metadata", "labels")
+
+	SetStringMapValues(labels, map[string]string{
+		"z": "last",
+		"a": "first",
+	}, SetValueOptions{SortKeys: true})
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	output := string(out)
+	require.Less(t, strings.Index(output, "a: first"), strings.Index(output, "z: last"))
+}
+
+func TestSetValueReplacesScalarWithSequence(t *testing.T) {
+	doc, err := Parse([]byte("spec:\n  workloadIdentity: old\n"))
+	require.NoError(t, err)
+	spec := EnsurePath(doc, "spec")
+
+	SetValue(spec, "workloadIdentity", []any{
+		map[string]any{
+			"namespace":      "fileservice",
+			"project":        "tp-nonprod-84cfda6b",
+			"serviceAccount": "fileservice",
+		},
+	}, SetValueOptions{SortKeys: true})
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.NotContains(t, string(out), "workloadIdentity: old")
+
+	var parsed map[string]map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+	require.Len(t, parsed["spec"]["workloadIdentity"], 1)
+}
+
 func TestEnsurePathConvertsScalarToMapping(t *testing.T) {
 	in := []byte("x: 1\n")
 	doc, err := Parse(in)

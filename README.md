@@ -131,6 +131,33 @@ env:
 > Behavior: If the key exists, we replace only the value token (preserving spacing and inline comment).
 > If it’s new, it’s appended at the mapping’s indent; strings are safely quoted on insertion.
 
+### Generic value setters
+
+* `SetValue(mapNode *yaml.Node, key string, value any, opts SetValueOptions)`
+  Writes a scalar, mapping, or sequence value under a mapping key.
+
+* `SetMapValues(mapNode *yaml.Node, fields map[string]any, opts SetValueOptions)`
+  Writes multiple arbitrary values into a mapping node.
+
+* `SetStringMapValues(mapNode *yaml.Node, fields map[string]string, opts SetValueOptions)`
+  Writes multiple string values into a mapping node.
+
+* `SetValueOptions{DeleteEmptyStrings bool, SortKeys bool}`
+  Controls whether empty strings delete keys and whether map keys are written in lexical order.
+
+Example:
+
+```go
+spec := yamledit.EnsurePath(doc, "spec")
+yamledit.SetMapValues(spec, map[string]any{
+	"enabled": true,
+	"ports":   []string{"http", "grpc"},
+	"selector": map[string]any{
+		"app": "checkout",
+	},
+}, yamledit.SetValueOptions{SortKeys: true})
+```
+
 ### Deletion (surgical)
 
 * `DeleteKey(mapNode *yaml.Node, key string)`

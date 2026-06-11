@@ -2,12 +2,19 @@ package yamledit
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	gyaml "github.com/goccy/go-yaml"
 	"gopkg.in/yaml.v3"
 )
+
+// SetValueOptions controls how generic YAML value writers handle map ordering and omissions.
+type SetValueOptions struct {
+	DeleteEmptyStrings bool
+	SortKeys           bool
+}
 
 // EnsurePath returns a mapping node for the nested keys (creates when missing).
 // It now accepts either a root DocumentNode or a MappingNode as the starting point.
@@ -359,6 +366,81 @@ func SetScalarNull(mapNode *yaml.Node, key string) {
 	})
 }
 
+// SetMapValues writes arbitrary map values into a YAML mapping node.
+func SetMapValues(mapNode *yaml.Node, fields map[string]any, opts SetValueOptions) {
+	if mapNode == nil || mapNode.Kind != yaml.MappingNode {
+		return
+	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	if opts.SortKeys {
+		sort.Strings(keys)
+	}
+	for _, key := range keys {
+		SetValue(mapNode, key, fields[key], opts)
+	}
+}
+
+// SetStringMapValues writes string map values into a YAML mapping node.
+func SetStringMapValues(mapNode *yaml.Node, fields map[string]string, opts SetValueOptions) {
+	if mapNode == nil || mapNode.Kind != yaml.MappingNode {
+		return
+	}
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	if opts.SortKeys {
+		sort.Strings(keys)
+	}
+	for _, key := range keys {
+		SetValue(mapNode, key, fields[key], opts)
+	}
+}
+
+// SetValue writes a scalar, mapping, or sequence value under a YAML mapping key.
+func SetValue(mapNode *yaml.Node, key string, value any, opts SetValueOptions) {
+	switch v := value.(type) {
+	case nil:
+		DeleteKey(mapNode, key)
+	case string:
+		if opts.DeleteEmptyStrings && strings.TrimSpace(v) == "" {
+			DeleteKey(mapNode, key)
+		} else {
+			SetScalarString(mapNode, key, v)
+		}
+	case bool:
+		SetScalarBool(mapNode, key, v)
+	case int:
+		SetScalarInt(mapNode, key, v)
+	case int64:
+		SetScalarInt(mapNode, key, int(v))
+	case float32:
+		SetScalarFloat(mapNode, key, float64(v))
+	case float64:
+		if v == float64(int(v)) {
+			SetScalarInt(mapNode, key, int(v))
+		} else {
+			SetScalarFloat(mapNode, key, v)
+		}
+	case []string:
+		values := make([]any, 0, len(v))
+		for _, item := range v {
+			values = append(values, item)
+		}
+		setSequenceValue(mapNode, key, values, opts)
+	case []any:
+		setSequenceValue(mapNode, key, v, opts)
+	case map[string]any:
+		child := EnsurePath(mapNode, key)
+		SetMapValues(child, v, opts)
+	default:
+		SetScalarString(mapNode, key, fmt.Sprintf("%v", v))
+	}
+}
+
 // DeleteKey removes all occurrences of 'key' under 'mapNode'.
 // Surgical deletion removes the complete lines for the key’s occurrences.
 // If surgery is unsafe/unavailable, Marshal() falls back to a structured re-encode.
@@ -612,4 +694,89 @@ func setAnyAtPath(ms gyaml.MapSlice, path []string, key string, val interface{})
 	sub := setAnyAtPath(gyaml.MapSlice{}, path[1:], key, val)
 	ms = append(ms, gyaml.MapItem{Key: head, Value: sub})
 	return ms
+}
+
+func setSequenceValue(mapNode *yaml.Node, key string, values []any, opts SetValueOptions) {
+	if len(values) == 0 {
+		DeleteKey(mapNode, key)
+		return
+	}
+	orderedValue := orderedValueForSet(values, opts)
+	setNodeValue(mapNode, key, orderedToYAMLNode(orderedValue), orderedValue)
+}
+
+func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedValue any) {
+	if mapNode == nil || mapNode.Kind != yaml.MappingNode || valueNode == nil {
+		return
+	}
+	st, docHN := stateForMapNode(mapNode)
+	if st != nil {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+	}
+
+	nextContent := make([]*yaml.Node, 0, len(mapNode.Content)+2)
+	for i := 0; i+1 < len(mapNode.Content); i += 2 {
+		keyNode := mapNode.Content[i]
+		if keyNode.Kind == yaml.ScalarNode && keyNode.Value == key {
+			continue
+		}
+		nextContent = append(nextContent, keyNode, mapNode.Content[i+1])
+	}
+	nextContent = append(nextContent, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, valueNode)
+	mapNode.Content = nextContent
+
+	if st == nil {
+		return
+	}
+	if _, ok := st.subPathByHN[mapNode]; !ok && docHN != nil && len(docHN.Content) > 0 {
+		indexMappingHandles(st, docHN.Content[0], nil)
+	}
+	if path, ok := st.subPathByHN[mapNode]; ok {
+		st.ordered = setAnyAtPath(st.ordered, path, key, orderedValue)
+		delete(st.toDelete, makePathKey(path, key))
+		if valueNode.Kind == yaml.MappingNode {
+			indexMappingHandles(st, valueNode, append(append([]string(nil), path...), key))
+		}
+	} else {
+		st.structuralDirty = true
+	}
+	if valueNode.Kind == yaml.SequenceNode {
+		st.arraysDirty = true
+	}
+	if valueNode.Kind == yaml.MappingNode {
+		st.structuralDirty = true
+	}
+}
+
+func orderedValueForSet(value any, opts SetValueOptions) any {
+	switch v := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		if opts.SortKeys {
+			sort.Strings(keys)
+		}
+		items := make(gyaml.MapSlice, 0, len(keys))
+		for _, key := range keys {
+			items = append(items, gyaml.MapItem{Key: key, Value: orderedValueForSet(v[key], opts)})
+		}
+		return items
+	case []string:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			out = append(out, item)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			out = append(out, orderedValueForSet(item, opts))
+		}
+		return out
+	default:
+		return v
+	}
 }

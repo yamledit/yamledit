@@ -3,7 +3,6 @@ package yamledit
 import (
 	"bytes"
 	"fmt"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -470,7 +469,7 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 			// Recurse into nested mappings.
 			if subCur, ok := cv.(gyaml.MapSlice); ok {
 				// Preserve the old behavior for map shape transitions.
-				if !okOrig || !reflect.DeepEqual(toPlain(ov), toPlain(cv)) {
+				if !okOrig || !logicalEqual(toPlain(ov), toPlain(cv)) {
 					if ovMs, okMs := ov.(gyaml.MapSlice); !okMs || len(subCur) == 0 || len(ovMs) == 0 {
 						out = append(out, makePathKey(path, k))
 					}
@@ -503,7 +502,7 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 						out = append(out, collectChangedKeysDeep(oel, cel, p2)...)
 						continue
 					}
-					if !reflect.DeepEqual(toPlain(oel), toPlain(cel)) {
+					if !logicalEqual(toPlain(oel), toPlain(cel)) {
 						needWholeSeqRewrite = true
 						break
 					}
@@ -515,7 +514,7 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 			}
 
 			// Scalars / non-container values.
-			if !okOrig || !reflect.DeepEqual(toPlain(ov), toPlain(cv)) {
+			if !okOrig || !logicalEqual(toPlain(ov), toPlain(cv)) {
 				out = append(out, makePathKey(path, k))
 			}
 		}

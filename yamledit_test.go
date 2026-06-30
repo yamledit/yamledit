@@ -1539,6 +1539,27 @@ func TestPlainStringsWithSpacesStayUnquotedOnUnrelatedChange(t *testing.T) {
 	}
 }
 
+func TestSetScalarIntNoopPreservesOriginal(t *testing.T) {
+	in := []byte(`service:
+  replicas: 5
+`)
+	doc, err := Parse(in)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	service := EnsurePath(doc, "service")
+	SetScalarInt(service, "replicas", 5)
+
+	out, err := Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(out) != string(in) {
+		t.Fatalf("expected no-op scalar update to preserve original\nbefore:\n%s\nafter:\n%s", in, out)
+	}
+}
+
 func TestDeleteKey_RemovesOnlyThatKey_Surgically(t *testing.T) {
 	in := []byte(`# header
 env:

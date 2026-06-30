@@ -3,6 +3,7 @@ package yamledit
 import (
 	"bytes"
 	"fmt"
+	"math/big"
 	"reflect"
 	"sort"
 	"strconv"
@@ -182,7 +183,86 @@ func marshalBySurgery(
 // Compare logical structures (ignores scalar formatting). Used to decide fallback when
 // no surgical patches were produced but the doc actually changed (e.g., array edits).
 func logicalEqualOrdered(a, b gyaml.MapSlice) bool {
-	return reflect.DeepEqual(toPlain(a), toPlain(b))
+	return logicalEqual(toPlain(a), toPlain(b))
+}
+
+func logicalEqual(a, b interface{}) bool {
+	if reflect.DeepEqual(a, b) {
+		return true
+	}
+
+	switch av := a.(type) {
+	case map[string]interface{}:
+		bv, ok := b.(map[string]interface{})
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for key, avv := range av {
+			bvv, ok := bv[key]
+			if !ok || !logicalEqual(avv, bvv) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		bv, ok := b.([]interface{})
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !logicalEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	ar, okA := numericAsRat(a)
+	br, okB := numericAsRat(b)
+	return okA && okB && ar.Cmp(br) == 0
+}
+
+func numericAsRat(v interface{}) (*big.Rat, bool) {
+	switch n := v.(type) {
+	case int:
+		return big.NewRat(int64(n), 1), true
+	case int8:
+		return big.NewRat(int64(n), 1), true
+	case int16:
+		return big.NewRat(int64(n), 1), true
+	case int32:
+		return big.NewRat(int64(n), 1), true
+	case int64:
+		return big.NewRat(n, 1), true
+	case uint:
+		return ratFromUint64(uint64(n)), true
+	case uint8:
+		return ratFromUint64(uint64(n)), true
+	case uint16:
+		return ratFromUint64(uint64(n)), true
+	case uint32:
+		return ratFromUint64(uint64(n)), true
+	case uint64:
+		return ratFromUint64(n), true
+	case float32:
+		return ratFromFloat64(float64(n))
+	case float64:
+		return ratFromFloat64(n)
+	default:
+		return nil, false
+	}
+}
+
+func ratFromUint64(v uint64) *big.Rat {
+	return new(big.Rat).SetInt(new(big.Int).SetUint64(v))
+}
+
+func ratFromFloat64(v float64) (*big.Rat, bool) {
+	rat := new(big.Rat)
+	if rat.SetFloat64(v) == nil {
+		return nil, false
+	}
+	return rat, true
 }
 
 func toPlain(v interface{}) interface{} {
@@ -1220,7 +1300,7 @@ func buildSeqReplaceBlockPatches(
 		// Compare the logical contents; if they are identical, we MUST NOT
 		// rewrite the block, or we risk corrupting nested structures like
 		// "paths" lists.
-		return !reflect.DeepEqual(toPlain(oldArr), toPlain(newArr))
+		return !logicalEqual(toPlain(oldArr), toPlain(newArr))
 	}
 
 	var walk func(ms gyaml.MapSlice, path []string) bool
@@ -1330,7 +1410,7 @@ func buildSeqReplaceBlockPatches(
 							for _, ctx := range contexts {
 								if !usedOriginalItems[ctx.index] {
 									// Check if the logical content is identical (order-independent for maps).
-									if reflect.DeepEqual(toPlain(ctx.data), toPlain(el)) {
+									if logicalEqual(toPlain(ctx.data), toPlain(el)) {
 										// Found an unused, identical original item. Reuse original bytes.
 
 										// 1. Preserve preceding Gap using preGap map.

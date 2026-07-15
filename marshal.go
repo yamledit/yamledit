@@ -39,54 +39,155 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	st, ok := lookup(doc)
 	if !ok {
 		// Fallback if somehow not registered
+		if err := validateYAMLAliasGraph(doc); err != nil {
+			return nil, err
+		}
 		var buf bytes.Buffer
 		enc := yaml.NewEncoder(&buf)
 		enc.SetIndent(2)
-		_ = enc.Encode(doc)
-		_ = enc.Close()
+		if err := enc.Encode(doc); err != nil {
+			_ = enc.Close()
+			return nil, err
+		}
+		if err := enc.Close(); err != nil {
+			return nil, err
+		}
 		return buf.Bytes(), nil
 	}
 
 	st.mu.RLock()
+	if err := validateYAMLAliasGraph(doc); err != nil {
+		st.mu.RUnlock()
+		return nil, err
+	}
+	if err := validateOrderedUTF8(st.ordered); err != nil {
+		st.mu.RUnlock()
+		return nil, err
+	}
+	if len(st.original) == 0 {
+		// Encode the live AST while holding the read lock. Snapshotting is not
+		// sufficient for a new document because the encoder traverses doc itself.
+		out, err := standardEncode(doc, st.indent)
+		st.mu.RUnlock()
+		return out, err
+	}
+	if st.originalTriviaOnly {
+		if logicalEqualOrdered(st.origOrdered, st.ordered) {
+			out := append([]byte(nil), st.original...)
+			st.mu.RUnlock()
+			return out, nil
+		}
+		encoded, err := standardEncode(doc, st.indent)
+		if err != nil {
+			st.mu.RUnlock()
+			return nil, err
+		}
+		encoded = normalizePatchLineEndings(st.original, encoded)
+		out := append([]byte(nil), st.original...)
+		nonBOM := bytes.TrimPrefix(out, []byte{0xef, 0xbb, 0xbf})
+		if len(nonBOM) > 0 && out[len(out)-1] != '\n' {
+			if firstLF := bytes.IndexByte(st.original, '\n'); firstLF > 0 && st.original[firstLF-1] == '\r' {
+				out = append(out, '\r')
+			}
+			out = append(out, '\n')
+		}
+		out = append(out, encoded...)
+		st.mu.RUnlock()
+		return validateEditedOutput(out)
+	}
+	if st.originalRootEmpty {
+		// An explicit `{}` root has no stable key-line anchor for surgery. Keep
+		// the exact input for a net-zero edit; otherwise encode the live AST while
+		// it is protected by the state lock.
+		if logicalEqualOrdered(st.origOrdered, st.ordered) {
+			out := append([]byte(nil), st.original...)
+			st.mu.RUnlock()
+			return out, nil
+		}
+		if st.rootTokenEnd <= st.rootTokenStart || st.rootTokenEnd > len(st.original) {
+			st.mu.RUnlock()
+			return nil, fmt.Errorf("yamledit: cannot safely replace explicit empty root mapping")
+		}
+		rootValue := orderedToYAMLNode(cloneMapSlice(st.ordered))
+		// Only the original `{}` token is replaced. Keeping the replacement in
+		// flow form prevents a preceding root tag or anchor (`!T {}`, `&a {}`)
+		// from binding to the first inserted key instead of the root mapping.
+		rootValue.Style |= yaml.FlowStyle
+		encodedRoot := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{rootValue}}
+		replacement, err := standardEncode(encodedRoot, st.indent)
+		if err == nil {
+			replacement = bytes.TrimSuffix(replacement, []byte("\n"))
+		}
+		out := make([]byte, 0, len(st.original)-(st.rootTokenEnd-st.rootTokenStart)+len(replacement))
+		out = append(out, st.original[:st.rootTokenStart]...)
+		out = append(out, replacement...)
+		out = append(out, st.original[st.rootTokenEnd:]...)
+		st.mu.RUnlock()
+		if err != nil {
+			return nil, err
+		}
+		return validateEditedOutput(out)
+	}
 	ordered := cloneMapSlice(st.ordered) // snapshot
 	indent := st.indent
 	original := st.original
 	mapIdx := cloneMapIndex(st.mapIndex)
 	valIdx := cloneValueIndex(st.valueOccByPathKey)
 	boundsIdx := cloneBoundsIndex(st.boundsByPathKey) // Clone new index
+	unsafePaths := make(map[string]struct{}, len(st.unsafePathKeys))
+	for path := range st.unsafePathKeys {
+		unsafePaths[path] = struct{}{}
+	}
+	semanticOpaquePaths := make(map[string]struct{}, len(st.opaquePathKeys))
+	for path := range st.opaquePathKeys {
+		semanticOpaquePaths[path] = struct{}{}
+	}
+	opaquePaths := make(map[string]struct{}, len(semanticOpaquePaths))
+	for path := range semanticOpaquePaths {
+		opaquePaths[path] = struct{}{}
+	}
+	presentationOpaquePaths := make(map[string]struct{})
+	if doc != nil && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		markLivePresentationOpaquePaths(doc.Content[0], nil, presentationOpaquePaths)
+	}
+	for path := range presentationOpaquePaths {
+		opaquePaths[path] = struct{}{}
+	}
 	origOrdered := cloneMapSlice(st.origOrdered)
 	delSet := make(map[string]struct{}, len(st.toDelete))
 	seqIdx := cloneSeqIndex(st.seqIndex)
 	for k := range st.toDelete {
 		delSet[k] = struct{}{}
 	}
-	arraysDirty := st.arraysDirty
 	structuralDirty := st.structuralDirty
+	rootMappingEmpty := doc != nil && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0
 	st.mu.RUnlock()
 
-	// If original file was empty (new file), fall back to standard YAML encoding.
-	// Surgical editing requires original content to patch, which doesn't exist for new files.
-	if len(original) == 0 {
-		return standardEncode(doc, indent)
-	}
-
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, indent, delSet)
-	if okPatch && !structuralDirty {
-		if arraysDirty {
-			if s, ok := lookup(doc); ok {
-				s.mu.Lock()
-				s.arraysDirty = false
-				s.mu.Unlock()
-			}
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, unsafePaths, semanticOpaquePaths, presentationOpaquePaths, indent, delSet)
+	if okPatch && (!structuralDirty || (bytes.Equal(out, original) && logicalEqualOrdered(origOrdered, ordered))) {
+		validated, err := validateEditedOutput(out)
+		if err != nil {
+			return nil, err
 		}
-		return out, nil
+		return validated, nil
 	}
 
-	if patched, ok := structuralRewrite(original, ordered, origOrdered, boundsIdx, indent, delSet); ok {
-		return patched, nil
+	if patched, ok := structuralRewrite(original, ordered, origOrdered, boundsIdx, unsafePaths, opaquePaths, indent, delSet, rootMappingEmpty); ok {
+		return validateEditedOutput(patched)
 	}
 
 	return nil, fmt.Errorf("yamledit: surgical edit unsupported; no safe structural rewrite")
+}
+
+func validateEditedOutput(out []byte) ([]byte, error) {
+	var doc yaml.Node
+	if err := decodeSingleYAMLDocument(out, &doc); err != nil {
+		return nil, fmt.Errorf("yamledit: edit would produce invalid YAML: %w", err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("yamledit: edit would change the document root from a mapping")
+	}
+	return out, nil
 }
 
 // standardEncode performs a standard YAML encoding without surgical editing.
@@ -108,9 +209,124 @@ func standardEncode(doc *yaml.Node, indent int) ([]byte, error) {
 }
 
 // structuralRewrite surgically re-encodes individual key regions using boundsIdx.
-func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, boundsIdx map[string][]kvBounds, baseIndent int, delSet map[string]struct{}) ([]byte, bool) {
+func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, boundsIdx map[string][]kvBounds, unsafePaths, opaquePaths map[string]struct{}, baseIndent int, delSet map[string]struct{}, rootMappingEmpty bool) ([]byte, bool) {
+	if rootMappingEmpty && len(ordered) == 0 && len(origOrdered) > 0 {
+		for pk := range unsafePaths {
+			if parts, ok := splitJoinedPath(pk); ok && len(parts) == 1 {
+				return nil, false
+			}
+		}
+		// Keep the document root a mapping when its last member is deleted.
+		// Replace just the span occupied by top-level entries so header/footer
+		// comments and document markers remain untouched.
+		start, end := len(original), -1
+		for pk, bounds := range boundsIdx {
+			parts, ok := splitJoinedPath(pk)
+			if !ok || len(parts) != 1 {
+				continue
+			}
+			for _, bound := range bounds {
+				if bound.start < start {
+					start = bound.start
+				}
+				if bound.end > end {
+					end = bound.end
+				}
+			}
+		}
+		if start >= 0 && start <= end && end <= len(original) {
+			replacement := []byte("{}")
+			if end > start && original[end-1] == '\n' {
+				replacement = append(replacement, '\n')
+			}
+			out := make([]byte, 0, len(original)-(end-start)+len(replacement))
+			out = append(out, original[:start]...)
+			out = append(out, replacement...)
+			out = append(out, original[end:]...)
+			return out, true
+		}
+	}
+
 	var patches []patch
 	patched := map[string]struct{}{}
+	changed := collectChangedKeysDeep(origOrdered, ordered, nil)
+	findSafeContainerAncestor := func(pk string) (string, bool) {
+		parts, ok := splitJoinedPath(pk)
+		if !ok {
+			return "", false
+		}
+		for i := len(parts) - 1; i >= 1; i-- {
+			ancestor := joinPath(parts[:i])
+			_, opaque := opaquePaths[ancestor]
+			if _, unsafe := unsafePaths[ancestor]; unsafe || opaque || len(boundsIdx[ancestor]) == 0 {
+				continue
+			}
+			parent, key := parts[:i-1], parts[i-1]
+			value, exists := orderedValueAt(ordered, parent, key)
+			if !exists {
+				continue
+			}
+			switch value.(type) {
+			case gyaml.MapSlice, []interface{}:
+				return ancestor, true
+			}
+		}
+		return "", false
+	}
+	changedSeen := make(map[string]struct{}, len(changed))
+	for _, pk := range changed {
+		changedSeen[pk] = struct{}{}
+	}
+	promoteUnsafe := func(pk string) {
+		if _, unsafe := unsafePaths[pk]; !unsafe {
+			return
+		}
+		if ancestor, ok := findSafeContainerAncestor(pk); ok {
+			if _, exists := changedSeen[ancestor]; !exists {
+				changed = append(changed, ancestor)
+				changedSeen[ancestor] = struct{}{}
+			}
+		}
+	}
+	for _, pk := range append([]string(nil), changed...) {
+		promoteUnsafe(pk)
+	}
+	for _, pk := range append([]string(nil), changed...) {
+		if len(boundsIdx[pk]) != 0 {
+			continue
+		}
+		if ancestor, ok := findSafeContainerAncestor(pk); ok {
+			if _, exists := changedSeen[ancestor]; !exists {
+				changed = append(changed, ancestor)
+				changedSeen[ancestor] = struct{}{}
+			}
+		}
+	}
+	for pk := range delSet {
+		promoteUnsafe(pk)
+	}
+	changedSet := make(map[string]struct{}, len(changed))
+	for _, pk := range changed {
+		changedSet[pk] = struct{}{}
+	}
+	hasChangedSafeAncestor := func(pk string) bool {
+		parts, ok := splitJoinedPath(pk)
+		if !ok {
+			return false
+		}
+		for i := len(parts) - 1; i >= 1; i-- {
+			ancestor := joinPath(parts[:i])
+			if _, changed := changedSet[ancestor]; !changed {
+				continue
+			}
+			_, opaque := opaquePaths[ancestor]
+			if _, unsafe := unsafePaths[ancestor]; unsafe || opaque || len(boundsIdx[ancestor]) == 0 {
+				continue
+			}
+			return true
+		}
+		return false
+	}
 
 	// Build "parent mapping → last child bounds" index so we can insert new keys.
 	// Keyed by joinPath(parentPathSegments).
@@ -133,10 +349,13 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 	rewritten := make(map[string]struct{}, 64)
 
 	hasRewrittenAncestor := func(pk string) bool {
-		segs := strings.Split(pk, pathSep)
+		segs, ok := splitJoinedPath(pk)
+		if !ok {
+			return false
+		}
 		// walk ancestors: a/b/c -> a/b, a
 		for i := len(segs) - 1; i >= 1; i-- {
-			anc := strings.Join(segs[:i], pathSep)
+			anc := joinPath(segs[:i])
 			if _, ok := rewritten[anc]; ok {
 				return true
 			}
@@ -145,17 +364,54 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 	}
 	// Deletions: remove key ranges for explicit deletions.
 	for pk := range delSet {
+		if _, unsafe := unsafePaths[pk]; unsafe {
+			if hasChangedSafeAncestor(pk) {
+				continue
+			}
+			return nil, false
+		}
 		bounds := boundsIdx[pk]
 		if len(bounds) == 0 {
 			continue
 		}
-		b := bounds[len(bounds)-1]
-		patches = append(patches, patch{start: b.start, end: b.end, data: []byte{}})
+		for _, b := range bounds {
+			patches = append(patches, patch{start: b.start, end: b.end, data: []byte{}})
+		}
 		patched[pk] = struct{}{}
 		rewritten[pk] = struct{}{}
 	}
 
-	changed := collectChangedKeysDeep(origOrdered, ordered, nil)
+	// Structural fallback must honor last-wins duplicate semantics too.
+	// Keep only widest ranges so a duplicate parent removal subsumes any
+	// duplicate children inside the same block without overlapping patches.
+	var duplicateRanges []kvBounds
+	for pk, bounds := range boundsIdx {
+		if _, unsafe := unsafePaths[pk]; unsafe {
+			continue
+		}
+		if _, deleting := delSet[pk]; deleting || len(bounds) <= 1 {
+			continue
+		}
+		duplicateRanges = append(duplicateRanges, bounds[:len(bounds)-1]...)
+	}
+	sort.Slice(duplicateRanges, func(i, j int) bool {
+		if duplicateRanges[i].start == duplicateRanges[j].start {
+			return duplicateRanges[i].end > duplicateRanges[j].end
+		}
+		return duplicateRanges[i].start < duplicateRanges[j].start
+	})
+	for _, candidate := range duplicateRanges {
+		contained := false
+		for _, existing := range patches {
+			if len(existing.data) == 0 && existing.start <= candidate.start && existing.end >= candidate.end {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			patches = append(patches, patch{start: candidate.start, end: candidate.end})
+		}
+	}
 
 	// Collect insertion candidates (keys that changed but have NO bounds => new keys).
 	var insertCands []string
@@ -164,6 +420,12 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 	for _, pk := range changed {
 		if _, skip := patched[pk]; skip {
 			continue
+		}
+		if _, unsafe := unsafePaths[pk]; unsafe {
+			if hasRewrittenAncestor(pk) || hasChangedSafeAncestor(pk) {
+				continue
+			}
+			return nil, false
 		}
 		bounds := boundsIdx[pk]
 		if len(bounds) == 0 {
@@ -180,7 +442,17 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		path, key := splitPathKey(pk)
 		val, ok := orderedValueAt(ordered, path, key)
 		if !ok {
+			// A complex add/replace can remove members without going through
+			// DeleteKey. Remove every original occurrence so stale or duplicate
+			// values cannot survive a successful replacement.
+			for _, b := range bounds {
+				patches = append(patches, patch{start: b.start, end: b.end, data: []byte{}})
+			}
+			rewritten[pk] = struct{}{}
 			continue
+		}
+		if _, opaque := opaquePaths[pk]; opaque {
+			return nil, false
 		}
 		b := bounds[len(bounds)-1]
 		if isSequence(val) {
@@ -210,10 +482,13 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 	// Reduce insertion candidates: if an ancestor is also new, only insert the top-most one.
 	var inserts []string
 	for _, pk := range insertCands {
-		segs := strings.Split(pk, pathSep)
+		segs, ok := splitJoinedPath(pk)
+		if !ok {
+			return nil, false
+		}
 		skip := false
 		for i := len(segs) - 1; i >= 1; i-- {
-			anc := strings.Join(segs[:i], pathSep)
+			anc := joinPath(segs[:i])
 			if _, ok := insertSet[anc]; ok {
 				skip = true
 				break
@@ -299,7 +574,7 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 			return nil, false
 		}
 		buf.Write(original[cursor:p.start])
-		buf.Write(p.data)
+		buf.Write(normalizePatchLineEndings(original, p.data))
 		cursor = p.end
 	}
 	if cursor < len(original) {
@@ -309,8 +584,8 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 }
 
 func splitPathKey(pk string) ([]string, string) {
-	parts := strings.Split(pk, pathSep)
-	if len(parts) == 0 {
+	parts, ok := splitJoinedPath(pk)
+	if !ok || len(parts) == 0 {
 		return nil, ""
 	}
 	return parts[:len(parts)-1], parts[len(parts)-1]
@@ -329,21 +604,18 @@ func orderedValueAt(ms gyaml.MapSlice, path []string, key string) (interface{}, 
 
 	var cur interface{} = ms
 	for _, seg := range path {
-		if idx, ok := parseIdx(seg); ok {
-			arr, okArr := cur.([]interface{})
-			if !okArr || idx < 0 || idx >= len(arr) {
+		switch m := cur.(type) {
+		case []interface{}:
+			idx, ok := parseIdx(seg)
+			if !ok || idx < 0 || idx >= len(m) {
 				return nil, false
 			}
-			cur = arr[idx]
-			continue
-		}
-
-		switch m := cur.(type) {
+			cur = m[idx]
 		case gyaml.MapSlice:
 			found := false
-			for _, it := range m {
-				if keyEquals(it.Key, seg) {
-					cur = it.Value
+			for i := len(m) - 1; i >= 0; i-- {
+				if keyEquals(m[i].Key, seg) {
+					cur = m[i].Value
 					found = true
 					break
 				}
@@ -364,9 +636,9 @@ func orderedValueAt(ms gyaml.MapSlice, path []string, key string) (interface{}, 
 
 	switch m := cur.(type) {
 	case gyaml.MapSlice:
-		for _, it := range m {
-			if keyEquals(it.Key, key) {
-				return it.Value, true
+		for i := len(m) - 1; i >= 0; i-- {
+			if keyEquals(m[i].Key, key) {
+				return m[i].Value, true
 			}
 		}
 		return nil, false
@@ -382,9 +654,14 @@ func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, ba
 	// IMPORTANT: do NOT convert to map[string]interface{} (it loses key order).
 	// Build a yaml.Node mapping and encode that (preserves gyaml.MapSlice order).
 	root := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	valueNode := orderedToYAMLNode(val)
+	valueNode.Anchor = b.anchor
+	if b.collectionTag != "" && (valueNode.Kind == yaml.MappingNode || valueNode.Kind == yaml.SequenceNode) {
+		valueNode.Tag = b.collectionTag
+	}
 	root.Content = append(root.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
-		orderedToYAMLNode(val),
+		valueNode,
 	)
 	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
 	lines, ok := encodeNodeLines(doc, baseIndent)
@@ -393,13 +670,28 @@ func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, ba
 	}
 	indentSpaces := currentIndent(original, b.start)
 	prefix := strings.Repeat(" ", indentSpaces)
+	inlineSequenceKey := false
+	lineEnd := findLineEnd(original, b.start)
+	if lineEnd >= b.start && b.start < len(original) {
+		line := original[b.start:min(lineEnd+1, len(original))]
+		first := leadingSpaces(line)
+		inlineSequenceKey = first+1 < len(line) && line[first] == '-' && (line[first+1] == ' ' || line[first+1] == '\t')
+	}
 	comment := inlineComment(original, b.start)
 
 	for i := range lines {
+		linePrefix := prefix
+		if inlineSequenceKey {
+			if i == 0 {
+				linePrefix += "- "
+			} else {
+				linePrefix = strings.Repeat(" ", indentSpaces+2)
+			}
+		}
 		if i == 0 && comment != "" {
-			lines[i] = prefix + lines[i] + " " + comment
+			lines[i] = linePrefix + lines[i] + " " + comment
 		} else {
-			lines[i] = prefix + lines[i]
+			lines[i] = linePrefix + lines[i]
 		}
 	}
 	out := strings.Join(lines, "\n")
@@ -431,10 +723,52 @@ func inlineComment(original []byte, start int) string {
 		end = len(original) - 1
 	}
 	line := original[i : end+1]
-	if idx := bytes.IndexByte(line, '#'); idx >= 0 {
+	if idx := yamlCommentStart(line); idx >= 0 {
 		return strings.TrimSpace(string(line[idx:]))
 	}
 	return ""
+}
+
+func yamlCommentStart(line []byte) int {
+	inSingle := false
+	inDouble := false
+	escaped := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if inDouble {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				if i+1 < len(line) && line[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '#':
+			if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []string {
@@ -445,6 +779,62 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 		default:
 			return false
 		}
+	}
+	mapLikeLen := func(v interface{}) int {
+		switch m := v.(type) {
+		case gyaml.MapSlice:
+			return len(m)
+		case map[string]interface{}:
+			return len(m)
+		case map[interface{}]interface{}:
+			return len(m)
+		default:
+			return -1
+		}
+	}
+	mapLikeHasRemoval := func(original, current interface{}) bool {
+		originalMap, originalOK := original.(gyaml.MapSlice)
+		currentMap, currentOK := current.(gyaml.MapSlice)
+		if !originalOK || !currentOK {
+			return false
+		}
+		seen := make(map[string]struct{})
+		for _, item := range originalMap {
+			key, ok := item.Key.(string)
+			if !ok {
+				continue
+			}
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			if _, exists := findLast(currentMap, key); !exists {
+				return true
+			}
+		}
+		return false
+	}
+	mapLikeHasAddition := func(original, current interface{}) bool {
+		originalMap, originalOK := original.(gyaml.MapSlice)
+		currentMap, currentOK := current.(gyaml.MapSlice)
+		if !originalOK || !currentOK {
+			return false
+		}
+		seen := make(map[string]struct{})
+		for _, item := range currentMap {
+			key, ok := item.Key.(string)
+			if !ok {
+				continue
+			}
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			if _, exists := findLast(originalMap, key); !exists {
+				return true
+			}
+		}
+		return false
 	}
 	appendSeg := func(base []string, seg string) []string {
 		out := append([]string(nil), base...)
@@ -458,9 +848,19 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 			o = om
 		}
 		var out []string
-		for _, it := range c {
+		for itemIndex, it := range c {
 			k, ok := it.Key.(string)
 			if !ok {
+				continue
+			}
+			shadowed := false
+			for later := itemIndex + 1; later < len(c); later++ {
+				if keyEquals(c[later].Key, k) {
+					shadowed = true
+					break
+				}
+			}
+			if shadowed {
 				continue
 			}
 			ov, okOrig := findLast(o, k)
@@ -498,6 +898,11 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 					oel := origArr[i]
 					cel := curArr[i]
 					if isMapLike(oel) && isMapLike(cel) {
+						oldMapLen, newMapLen := mapLikeLen(oel), mapLikeLen(cel)
+						if (oldMapLen == 0) != (newMapLen == 0) || mapLikeHasRemoval(oel, cel) || mapLikeHasAddition(oel, cel) {
+							needWholeSeqRewrite = true
+							break
+						}
 						p2 := appendSeg(appendSeg(path, k), indexSeg(i))
 						out = append(out, collectChangedKeysDeep(oel, cel, p2)...)
 						continue
@@ -517,6 +922,24 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 			if !okOrig || !logicalEqual(toPlain(ov), toPlain(cv)) {
 				out = append(out, makePathKey(path, k))
 			}
+		}
+		// Also report keys that existed in the original mapping but are absent
+		// now. Walking only the current mapping made object replacement retain
+		// omitted members indefinitely.
+		seenMissing := make(map[string]struct{})
+		for _, it := range o {
+			k, ok := it.Key.(string)
+			if !ok {
+				continue
+			}
+			if _, duplicate := seenMissing[k]; duplicate {
+				continue
+			}
+			if _, exists := findLast(c, k); exists {
+				continue
+			}
+			seenMissing[k] = struct{}{}
+			out = append(out, makePathKey(path, k))
 		}
 		return out
 	default:
@@ -548,79 +971,52 @@ func renderSequenceValue(original []byte, key string, val interface{}, b kvBound
 		return "", false
 	}
 	indentSpaces := currentIndent(original, b.start)
+	comment := inlineComment(original, b.start)
 
 	var sb strings.Builder
 	sb.WriteString(strings.Repeat(" ", indentSpaces))
-	sb.WriteString(key)
+	sb.WriteString(renderMappingKey(key))
 	if len(arr) == 0 {
-		sb.WriteString(": []")
+		sb.WriteString(":")
+		if b.collectionTag != "" {
+			sb.WriteString(" ")
+			sb.WriteString(renderYAMLTagProperty(b.collectionTag))
+		}
+		if b.anchor != "" {
+			sb.WriteString(" &")
+			sb.WriteString(b.anchor)
+		}
+		sb.WriteString(" []")
+		if comment != "" {
+			sb.WriteString(" ")
+			sb.WriteString(comment)
+		}
 		if b.end > b.start && b.end <= len(original) && original[b.end-1] == '\n' {
 			sb.WriteString("\n")
 		}
 		return sb.String(), true
 	}
-	sb.WriteString(":\n")
+	sb.WriteString(":")
+	if b.collectionTag != "" {
+		sb.WriteString(" ")
+		sb.WriteString(renderYAMLTagProperty(b.collectionTag))
+	}
+	if b.anchor != "" {
+		sb.WriteString(" &")
+		sb.WriteString(b.anchor)
+	}
+	if comment != "" {
+		sb.WriteString(" ")
+		sb.WriteString(comment)
+	}
+	sb.WriteString("\n")
 
-	// dashIndent is where "- " starts for items under this key.
+	// dashIndent is where sequence items start under this key.
 	dashIndent := indentSpaces + baseIndent
-	// continuationIndent aligns subsequent lines under the first key after "- ".
-	continuationIndent := dashIndent + 2
-
-	isMapLike := func(v interface{}) bool {
-		switch v.(type) {
-		case gyaml.MapSlice, map[string]interface{}, map[interface{}]interface{}:
-			return true
-		default:
-			return false
-		}
-	}
-
-	encodeAsLines := func(v interface{}) ([]string, bool) {
-		// IMPORTANT: do NOT call toPlain(v) here, it destroys gyaml.MapSlice ordering
-		// and the yaml encoder will reorder keys (your exact bug).
-		n := orderedToYAMLNode(v)
-		// yaml encoder prefers DocumentNode; strip '---' if any.
-		doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{n}}
-		return encodeNodeLines(doc, baseIndent)
-	}
-
 	for _, el := range arr {
-		// If the element is a mapping, render it as a proper YAML list item
-		// instead of going through renderScalarLine (which produces "- key/value" noise).
-		if isMapLike(el) {
-			lines, ok := encodeAsLines(el)
-			if !ok {
-				return "", false
-			}
-			if len(lines) == 0 {
-				// empty map -> "- {}"
-				sb.WriteString(strings.Repeat(" ", dashIndent))
-				sb.WriteString("- {}")
-				sb.WriteString("\n")
-				continue
-			}
-
-			// First line gets the dash.
-			sb.WriteString(strings.Repeat(" ", dashIndent))
-			sb.WriteString("- ")
-			sb.WriteString(lines[0])
-			sb.WriteString("\n")
-
-			// Subsequent lines align under the first key (2 spaces after dashIndent).
-			for i := 1; i < len(lines); i++ {
-				sb.WriteString(strings.Repeat(" ", continuationIndent))
-				sb.WriteString(lines[i])
-				sb.WriteString("\n")
-			}
-			continue
+		if !renderYAMLSequenceElement(&sb, el, dashIndent, baseIndent) {
+			return "", false
 		}
-
-		// Scalar item: keep existing behavior.
-		line := renderScalarLine(el)
-		sb.WriteString(strings.Repeat(" ", dashIndent))
-		sb.WriteString("- ")
-		sb.WriteString(line)
-		sb.WriteString("\n")
 	}
 	// Trim trailing newline if original region had none.
 	if b.end <= len(original) && b.end > b.start && original[b.end-1] != '\n' {
@@ -631,27 +1027,20 @@ func renderSequenceValue(original []byte, key string, val interface{}, b kvBound
 	return sb.String(), true
 }
 
-func renderScalarLine(v interface{}) string {
-	switch t := v.(type) {
-	case string:
-		if isSafeBareString(t) {
-			return t
-		}
-		return quoteNewStringToken(t)
-	case int:
-		return fmt.Sprintf("%d", t)
-	case float64:
-		return strconv.FormatFloat(t, 'g', -1, 64)
-	case bool:
-		if t {
-			return "true"
-		}
-		return "false"
-	default:
-		b, err := yaml.Marshal(v)
-		if err != nil {
-			return fmt.Sprint(v)
-		}
-		return strings.TrimSpace(string(b))
+func renderYAMLTagProperty(tag string) string {
+	if strings.HasPrefix(tag, "!") {
+		return tag
 	}
+	return "!<" + tag + ">"
+}
+
+func renderScalarLine(v interface{}) string {
+	if rendered, ok := renderScalarToken(v); ok {
+		return rendered
+	}
+	b, err := yaml.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return strings.TrimSpace(string(b))
 }

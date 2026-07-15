@@ -20,9 +20,9 @@ Think: *change exactly the bytes you mean to - leave everything else untouched.*
 
 ```bash
 go get github.com/yamledit/yamledit
-````
+```
 
-Go 1.21+
+Go 1.24.1+
 
 ---
 
@@ -176,6 +176,8 @@ yamledit.SetMapValues(spec, map[string]any{
 
 * `basePath` lets you interpret each op’s pointer **relative** to a mapping path (e.g. `[]string{"service","envs"}`).
 * Arrays: targeted edits (`/0/property`, `/-` appends) often remain **surgical**. Whole‑array replaces may fall back.
+* Root-target mutations (`path: ""`) are rejected because edited documents must keep a mapping root; root `test` is supported.
+* An alias value can be tested or copied, but paths do not traverse through an alias into its target mapping.
 
 **Example: replace a field inside an array item (single‑line diff)**
 

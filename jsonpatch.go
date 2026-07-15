@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
 	gyaml "github.com/goccy/go-yaml"
@@ -36,6 +39,9 @@ func ApplyJSONPatch(node *yaml.Node, patch jsonpatch.Patch) error {
 // ApplyJSONPatchAtPathBytes applies a JSON Patch, treating each op's path as relative
 // to the given basePath (sequence of mapping keys).
 func ApplyJSONPatchAtPathBytes(node *yaml.Node, patchJSON []byte, basePath []string) error {
+	if !utf8.Valid(patchJSON) {
+		return errors.New("yamledit: invalid JSON Patch: input is not valid UTF-8")
+	}
 	ops, err := decodePatchOps(patchJSON)
 	if err != nil {
 		return err
@@ -61,17 +67,84 @@ type patchOp struct {
 	Path  string          `json:"path"`
 	Value json.RawMessage `json:"value,omitempty"`
 	From  string          `json:"from,omitempty"`
+
+	hasValue bool
+	hasFrom  bool
+}
+
+func (op *patchOp) UnmarshalJSON(data []byte) error {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	if members == nil {
+		return errors.New("operation must be an object")
+	}
+	decodeRequiredString := func(name string) (string, error) {
+		raw, ok := members[name]
+		if !ok {
+			return "", fmt.Errorf("missing required member %q", name)
+		}
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return "", fmt.Errorf("member %q must be a string", name)
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", fmt.Errorf("member %q must be a string: %w", name, err)
+		}
+		return value, nil
+	}
+
+	var err error
+	if op.Op, err = decodeRequiredString("op"); err != nil {
+		return err
+	}
+	if op.Path, err = decodeRequiredString("path"); err != nil {
+		return err
+	}
+	if raw, ok := members["value"]; ok {
+		op.Value = append(op.Value[:0], raw...)
+		op.hasValue = true
+	}
+	if raw, ok := members["from"]; ok && (op.Op == "move" || op.Op == "copy") {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return errors.New("member \"from\" must be a string")
+		}
+		if err := json.Unmarshal(raw, &op.From); err != nil {
+			return fmt.Errorf("member \"from\" must be a string: %w", err)
+		}
+		op.hasFrom = true
+	}
+	return nil
 }
 
 func decodePatchOps(b []byte) ([]patchOp, error) {
 	var ops []patchOp
 	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&ops); err != nil {
 		return nil, fmt.Errorf("yamledit: invalid JSON Patch: %w", err)
 	}
-	if len(ops) == 0 {
-		return nil, errors.New("yamledit: empty JSON Patch")
+	if ops == nil {
+		return nil, errors.New("yamledit: JSON Patch must be an array")
+	}
+	for i, op := range ops {
+		switch op.Op {
+		case "add", "replace", "test":
+			if !op.hasValue {
+				return nil, fmt.Errorf("yamledit: JSON Patch operation %d (%s) is missing required member \"value\"", i, op.Op)
+			}
+		case "move", "copy":
+			if !op.hasFrom {
+				return nil, fmt.Errorf("yamledit: JSON Patch operation %d (%s) is missing required member \"from\"", i, op.Op)
+			}
+		}
+	}
+	var trailing interface{}
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = errors.New("unexpected trailing JSON value")
+		}
+		return nil, fmt.Errorf("yamledit: invalid JSON Patch: %w", err)
 	}
 	return ops, nil
 }
@@ -85,12 +158,9 @@ type ptrToken struct {
 }
 
 func parseJSONPointer(p string) ([]ptrToken, error) {
-	if p == "" || p == "/" {
-		// root pointer; empty token list means operate on 'node' itself
-		if p == "/" {
-			// split on leading '/', yields ["", ...], trim empty head
-			return []ptrToken{}, nil
-		}
+	if p == "" {
+		// The empty string is the root pointer. "/" instead addresses an
+		// object member whose key is the empty string.
 		return []ptrToken{}, nil
 	}
 	if !strings.HasPrefix(p, "/") {
@@ -99,19 +169,61 @@ func parseJSONPointer(p string) ([]ptrToken, error) {
 	parts := strings.Split(p, "/")[1:]
 	toks := make([]ptrToken, 0, len(parts))
 	for _, s := range parts {
-		seg := strings.ReplaceAll(strings.ReplaceAll(s, "~1", "/"), "~0", "~")
+		seg, err := unescapeJSONPointerToken(s)
+		if err != nil {
+			return nil, err
+		}
 		if seg == "-" {
-			toks = append(toks, ptrToken{isIdx: true, append: true})
+			toks = append(toks, ptrToken{key: seg, isIdx: true, append: true})
 			continue
 		}
-		// numeric?
-		if i, err := strconv.Atoi(seg); err == nil {
-			toks = append(toks, ptrToken{isIdx: true, index: i})
-			continue
+		// Classify a syntactically valid RFC 6902 array index, while retaining
+		// the raw key. Container type decides whether "0" is an index or an
+		// object member name.
+		if isJSONArrayIndex(seg) {
+			if i, err := strconv.Atoi(seg); err == nil {
+				toks = append(toks, ptrToken{key: seg, isIdx: true, index: i})
+				continue
+			}
 		}
 		toks = append(toks, ptrToken{key: seg})
 	}
 	return toks, nil
+}
+
+func unescapeJSONPointerToken(s string) (string, error) {
+	var out strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '~' {
+			out.WriteByte(s[i])
+			continue
+		}
+		if i+1 >= len(s) || (s[i+1] != '0' && s[i+1] != '1') {
+			return "", fmt.Errorf("yamledit: invalid JSON Pointer escape in %q", s)
+		}
+		i++
+		if s[i] == '0' {
+			out.WriteByte('~')
+		} else {
+			out.WriteByte('/')
+		}
+	}
+	return out.String(), nil
+}
+
+func isJSONArrayIndex(s string) bool {
+	if s == "0" {
+		return true
+	}
+	if len(s) == 0 || s[0] < '1' || s[0] > '9' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // applyDecodedPatch executes ops in-order, relative to basePath.
@@ -120,24 +232,80 @@ func applyDecodedPatch(node *yaml.Node, ops []patchOp, basePath []string) error 
 		return errors.New("yamledit: nil node")
 	}
 
-	// Identify starting mapping + doc state.
-	startMap, baseFromRoot, st, docHN, err := resolveStart(node)
+	// Discover registered ownership without reading fields on node. A mapping
+	// handle can be converted to another YAML kind by a concurrent state-aware
+	// edit, so even reading node.Kind must happen under the owning document lock.
+	st, docHN, isDocument, registered := findRegisteredNodeOwner(node)
+	var startMap *yaml.Node
+	var baseFromRoot []ptrToken
+	var err error
+	if registered {
+		// Protect both the yaml.Node tree and its ordered shadow for the entire
+		// patch, including classification and validation of the starting node.
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		startMap, baseFromRoot, err = resolveRegisteredStartLocked(node, st, docHN, isDocument)
+	} else {
+		// Nodes that were not returned by Parse have no shared docState contract,
+		// so preserve the existing standalone DocumentNode/MappingNode behavior.
+		startMap, err = resolveUnregisteredStart(node)
+	}
 	if err != nil {
 		return err
 	}
+	if startMap == nil {
+		return errors.New("yamledit: could not resolve starting mapping")
+	}
+	if !registered {
+		// Operations on an unregistered node should not accidentally receive a
+		// stale registry state from the declarations above.
+		st = nil
+		docHN = nil
+		baseFromRoot = nil
+	}
+	baseTokens := make([]ptrToken, 0, len(basePath))
+	for _, k := range basePath {
+		baseTokens = append(baseTokens, ptrToken{key: k})
+	}
+
+	// JSON Patch is atomic: validate the full, sequential operation list on a
+	// graph-preserving clone before touching the live AST. This also catches
+	// ordered-shadow update failures for registered documents. Without this
+	// pass, an early successful operation remained visible when a later test or
+	// path lookup failed.
+	preflightStart := cloneYAMLNodeGraph(startMap)
+	var preflightDoc *yaml.Node
+	var preflightState *docState
+	if st != nil {
+		// Clone the complete document, not just the selected mapping. Alias nodes
+		// outside a mapping handle can still point at anchors inside it, and those
+		// references must participate in the atomic preflight.
+		var cloned map[*yaml.Node]*yaml.Node
+		preflightDoc, cloned = cloneYAMLNodeGraphWithMap(docHN)
+		preflightStart = cloned[startMap]
+		if preflightDoc == nil || preflightStart == nil {
+			return errors.New("yamledit: could not clone document for JSON Patch preflight")
+		}
+		preflightState = &docState{ordered: cloneMapSlice(st.ordered)}
+	}
+	if err := executeDecodedPatch(preflightStart, preflightState, preflightDoc, baseFromRoot, ops, baseTokens); err != nil {
+		return err
+	}
+	return executeDecodedPatch(startMap, st, docHN, baseFromRoot, ops, baseTokens)
+}
+
+func executeDecodedPatch(startMap *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []ptrToken, ops []patchOp, baseTokens []ptrToken) error {
 	for _, op := range ops {
 		segPath, err := parseJSONPointer(op.Path)
 		if err != nil {
 			return err
 		}
 		// Prepend basePath (mapping segments only).
-		combined := make([]ptrToken, 0, len(basePath)+len(segPath))
-		for _, k := range basePath {
-			combined = append(combined, ptrToken{key: k})
-		}
+		combined := make([]ptrToken, 0, len(baseTokens)+len(segPath))
+		combined = append(combined, baseTokens...)
 		combined = append(combined, segPath...)
 
-		switch strings.ToLower(op.Op) {
+		switch op.Op {
 		case "test":
 			if err := opTest(startMap, combined, op.Value); err != nil {
 				return err
@@ -147,7 +315,7 @@ func applyDecodedPatch(node *yaml.Node, ops []patchOp, basePath []string) error 
 				return err
 			}
 		case "remove":
-			if err := opRemove(startMap, st, baseFromRoot, combined); err != nil {
+			if err := opRemove(startMap, st, docHN, baseFromRoot, combined); err != nil {
 				return err
 			}
 		case "replace":
@@ -155,11 +323,21 @@ func applyDecodedPatch(node *yaml.Node, ops []patchOp, basePath []string) error 
 				return err
 			}
 		case "move":
-			if err := opMove(startMap, st, docHN, baseFromRoot, op.From, op.Path); err != nil {
+			from, err := parseJSONPointer(op.From)
+			if err != nil {
+				return err
+			}
+			from = append(append([]ptrToken(nil), baseTokens...), from...)
+			if err := opMove(startMap, st, docHN, baseFromRoot, from, combined); err != nil {
 				return err
 			}
 		case "copy":
-			if err := opCopy(startMap, st, docHN, baseFromRoot, op.From, op.Path); err != nil {
+			from, err := parseJSONPointer(op.From)
+			if err != nil {
+				return err
+			}
+			from = append(append([]ptrToken(nil), baseTokens...), from...)
+			if err := opCopy(startMap, st, docHN, baseFromRoot, from, combined); err != nil {
 				return err
 			}
 		default:
@@ -169,31 +347,74 @@ func applyDecodedPatch(node *yaml.Node, ops []patchOp, basePath []string) error 
 	return nil
 }
 
-// resolveStart returns the mapping node to operate on, the YAML path from root,
-// the docState and the root document handle.
-func resolveStart(node *yaml.Node) (startMap *yaml.Node, pathFromRoot []string, st *docState, docHN *yaml.Node, err error) {
+func cloneYAMLNodeGraph(root *yaml.Node) *yaml.Node {
+	cloned, _ := cloneYAMLNodeGraphWithMap(root)
+	return cloned
+}
+
+func cloneYAMLNodeGraphWithMap(root *yaml.Node) (*yaml.Node, map[*yaml.Node]*yaml.Node) {
+	seen := make(map[*yaml.Node]*yaml.Node)
+	var clone func(*yaml.Node) *yaml.Node
+	clone = func(node *yaml.Node) *yaml.Node {
+		if node == nil {
+			return nil
+		}
+		if existing := seen[node]; existing != nil {
+			return existing
+		}
+		copyNode := *node
+		copyNode.Content = nil
+		copyNode.Alias = nil
+		seen[node] = &copyNode
+		if len(node.Content) > 0 {
+			copyNode.Content = make([]*yaml.Node, len(node.Content))
+			for i, child := range node.Content {
+				copyNode.Content[i] = clone(child)
+			}
+		}
+		copyNode.Alias = clone(node.Alias)
+		return &copyNode
+	}
+	return clone(root), seen
+}
+
+// resolveUnregisteredStart preserves JSON Patch support for standalone yaml.Node
+// values. Registered nodes must instead be classified by
+// resolveRegisteredStartLocked so their fields are never read outside st.mu.
+func resolveUnregisteredStart(node *yaml.Node) (*yaml.Node, error) {
 	switch node.Kind {
 	case yaml.DocumentNode:
 		if len(node.Content) == 0 || node.Content[0].Kind != yaml.MappingNode {
-			return nil, nil, nil, nil, errors.New("yamledit: document root is not a mapping")
+			return nil, errors.New("yamledit: document root is not a mapping")
 		}
-		startMap = node.Content[0]
-		if s, ok := lookup(node); ok {
-			st = s
-			docHN = node
-			pathFromRoot = nil
-		}
+		return node.Content[0], nil
 	case yaml.MappingNode:
-		startMap = node
-		if s, doc, base, ok := findOwnerByMapNode(startMap); ok {
-			st = s
-			docHN = doc
-			pathFromRoot = base
-		}
+		return node, nil
 	default:
-		return nil, nil, nil, nil, errors.New("yamledit: ApplyJSONPatch requires a DocumentNode or MappingNode")
+		return nil, errors.New("yamledit: ApplyJSONPatch requires a DocumentNode or MappingNode")
 	}
-	return
+}
+
+// resolveRegisteredStartLocked classifies and revalidates a registered patch
+// target. The caller must hold st.mu for writing.
+func resolveRegisteredStartLocked(node *yaml.Node, st *docState, docHN *yaml.Node, isDocument bool) (*yaml.Node, []ptrToken, error) {
+	rootDoc := st.root()
+	if rootDoc == nil || rootDoc != docHN || len(rootDoc.Content) == 0 {
+		return nil, nil, errors.New("yamledit: document is no longer available")
+	}
+	if isDocument {
+		if node != rootDoc || node.Kind != yaml.DocumentNode || node.Content[0].Kind != yaml.MappingNode {
+			return nil, nil, errors.New("yamledit: document root is not a mapping")
+		}
+		return node.Content[0], nil, nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil, nil, errors.New("yamledit: ApplyJSONPatch requires a DocumentNode or MappingNode")
+	}
+	if exact, ok := addressableTokenPathToNode(rootDoc.Content[0], node); ok {
+		return node, exact, nil
+	}
+	return nil, nil, errors.New("yamledit: starting mapping is no longer attached to the document")
 }
 
 // --- JSON → (ordered value, yaml.Node) helpers ---
@@ -214,18 +435,9 @@ func decodeJSONValue(raw json.RawMessage) (interface{}, error) {
 func jsonValueToOrdered(v interface{}) interface{} {
 	switch t := v.(type) {
 	case json.Number:
-		if strings.ContainsAny(string(t), ".eE") {
-			f, _ := t.Float64()
-			return f
-		}
-		// int
-		i, err := t.Int64()
-		if err != nil {
-			// fallback
-			f, _ := t.Float64()
-			return f
-		}
-		return int(i)
+		// Keep the lexical JSON number. Converting through float64 silently
+		// rounds large decimals and can turn a finite exponent into infinity.
+		return t
 	case float64, bool, string, nil:
 		return t
 	case []interface{}:
@@ -262,19 +474,13 @@ func jsonValueToYAMLNode(v interface{}) *yaml.Node {
 		}
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "false"}
 	case json.Number:
+		tag := "!!int"
 		if strings.ContainsAny(string(t), ".eE") {
-			f, _ := t.Float64()
-			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: strconv.FormatFloat(f, 'g', -1, 64)}
+			tag = "!!float"
 		}
-		i, err := t.Int64()
-		if err != nil {
-			// fallback to float
-			f, _ := t.Float64()
-			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: strconv.FormatFloat(f, 'g', -1, 64)}
-		}
-		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatInt(i, 10)}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: string(t)}
 	case float64:
-		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: strconv.FormatFloat(t, 'g', -1, 64)}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: formatYAMLFloat(t)}
 	case int:
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(t)}
 	case int64:
@@ -308,25 +514,62 @@ func jsonValueToYAMLNode(v interface{}) *yaml.Node {
 
 // yamlNodeToInterface converts a YAML node to canonical Go types for comparison.
 func yamlNodeToInterface(n *yaml.Node) interface{} {
+	budget := orderedShadowNodeBudget
+	return yamlNodeToInterfaceSeen(n, make(map[*yaml.Node]bool), &budget)
+}
+
+func yamlNodeToInterfaceSeen(n *yaml.Node, visiting map[*yaml.Node]bool, budget *int) interface{} {
 	if n == nil {
 		return nil
 	}
+	if budget == nil || *budget <= 0 {
+		return unsupportedJSONValue{"YAML graph exceeds JSON conversion limit"}
+	}
+	*budget = *budget - 1
+	if visiting[n] {
+		return unsupportedJSONValue{"recursive YAML alias"}
+	}
+	visiting[n] = true
+	defer delete(visiting, n)
 	switch n.Kind {
 	case yaml.ScalarNode:
 		switch n.Tag {
 		case "!!null":
 			return nil
 		case "!!bool":
-			return strings.EqualFold(n.Value, "true")
+			var value bool
+			if err := n.Decode(&value); err == nil {
+				return value
+			}
+			switch strings.ToLower(strings.TrimSpace(n.Value)) {
+			case "true", "y", "yes", "on":
+				return true
+			case "false", "n", "no", "off":
+				return false
+			default:
+				return unsupportedJSONValue{"YAML boolean has an invalid spelling"}
+			}
 		case "!!int":
-			// best-effort parse
-			if i, err := strconv.ParseInt(n.Value, 10, 64); err == nil {
+			// Preserve exact decimal integers where possible, while also honoring
+			// YAML base prefixes and digit separators (0x10, 0o20, 1_000).
+			decimal := strings.ReplaceAll(n.Value, "_", "")
+			if i, err := strconv.ParseInt(decimal, 0, 64); err == nil {
 				return int(i)
 			}
-			return n.Value
+			if u, err := strconv.ParseUint(decimal, 0, 64); err == nil {
+				return u
+			}
+			return json.Number(decimal)
 		case "!!float":
-			if f, err := strconv.ParseFloat(n.Value, 64); err == nil {
-				return f
+			decimal := strings.ReplaceAll(n.Value, "_", "")
+			if _, ok := normalizeDecimalNumber(decimal); ok {
+				return json.Number(decimal)
+			}
+			var decoded interface{}
+			if err := n.Decode(&decoded); err == nil {
+				if value, ok := decoded.(float64); ok {
+					return value
+				}
 			}
 			return n.Value
 		default:
@@ -335,20 +578,32 @@ func yamlNodeToInterface(n *yaml.Node) interface{} {
 	case yaml.MappingNode:
 		m := map[string]interface{}{}
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			if n.Content[i].Kind == yaml.ScalarNode {
-				m[n.Content[i].Value] = yamlNodeToInterface(n.Content[i+1])
+			key := n.Content[i]
+			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+				return unsupportedJSONValue{"YAML mapping has a non-string key"}
 			}
+			m[key.Value] = yamlNodeToInterfaceSeen(n.Content[i+1], visiting, budget)
 		}
 		return m
 	case yaml.SequenceNode:
 		arr := make([]interface{}, 0, len(n.Content))
 		for _, c := range n.Content {
-			arr = append(arr, yamlNodeToInterface(c))
+			arr = append(arr, yamlNodeToInterfaceSeen(c, visiting, budget))
 		}
 		return arr
+	case yaml.AliasNode:
+		return yamlNodeToInterfaceSeen(n.Alias, visiting, budget)
 	default:
 		return nil
 	}
+}
+
+type unsupportedJSONValue struct {
+	reason string
+}
+
+func (v unsupportedJSONValue) MarshalJSON() ([]byte, error) {
+	return nil, fmt.Errorf("yamledit: %s is not JSON-compatible", v.reason)
 }
 
 // --- Path resolution on YAML AST ---
@@ -380,13 +635,13 @@ func resolveParent(start *yaml.Node, tokens []ptrToken, createForAdd bool) (pare
 	for i := 0; i < len(tokens)-1; i++ {
 		t := tokens[i]
 		if cur.Kind == yaml.MappingNode {
-			if t.isIdx {
-				return nil, ptrToken{}, fmt.Errorf("yamledit: cannot index into mapping at segment %d", i)
+			if hasNonStringMappingKeyNamed(cur, t.key) {
+				return nil, ptrToken{}, fmt.Errorf("yamledit: path %q collides with a non-string YAML key", t.key)
 			}
 			// find mapping key
 			var child *yaml.Node
-			for j := 0; j+1 < len(cur.Content); j += 2 {
-				if cur.Content[j].Kind == yaml.ScalarNode && cur.Content[j].Value == t.key {
+			for j := len(cur.Content) - 2; j >= 0; j -= 2 {
+				if isStringMappingKey(cur.Content[j], t.key) {
 					child = cur.Content[j+1]
 					break
 				}
@@ -403,7 +658,7 @@ func resolveParent(start *yaml.Node, tokens []ptrToken, createForAdd bool) (pare
 			}
 			cur = child
 		} else if cur.Kind == yaml.SequenceNode {
-			if !t.isIdx {
+			if !t.isIdx || t.append {
 				return nil, ptrToken{}, fmt.Errorf("yamledit: expected array index at segment %d", i)
 			}
 			if t.index < 0 || t.index >= len(cur.Content) {
@@ -414,20 +669,88 @@ func resolveParent(start *yaml.Node, tokens []ptrToken, createForAdd bool) (pare
 			return nil, ptrToken{}, fmt.Errorf("yamledit: cannot traverse into node kind %v at segment %d", cur.Kind, i)
 		}
 	}
-	return cur, tokens[len(tokens)-1], nil
+	last = tokens[len(tokens)-1]
+	if cur.Kind == yaml.MappingNode && hasNonStringMappingKeyNamed(cur, last.key) {
+		return nil, ptrToken{}, fmt.Errorf("yamledit: path %q collides with a non-string YAML key", last.key)
+	}
+	return cur, last, nil
+}
+
+func logicalPatchPathSegments(start *yaml.Node, baseFromRoot, tokens []ptrToken) ([]string, bool) {
+	cur := start
+	if cur != nil && cur.Kind == yaml.DocumentNode {
+		if len(cur.Content) == 0 {
+			return nil, false
+		}
+		cur = cur.Content[0]
+	}
+	out := append([]string(nil), tokenPathSegments(baseFromRoot)...)
+	for index, token := range tokens {
+		last := index == len(tokens)-1
+		if cur == nil {
+			return nil, false
+		}
+		switch cur.Kind {
+		case yaml.MappingNode:
+			out = append(out, token.key)
+			if last {
+				continue
+			}
+			var child *yaml.Node
+			for i := len(cur.Content) - 2; i >= 0; i -= 2 {
+				if isStringMappingKey(cur.Content[i], token.key) {
+					child = cur.Content[i+1]
+					break
+				}
+			}
+			if child == nil {
+				return nil, false
+			}
+			cur = child
+		case yaml.SequenceNode:
+			if !token.isIdx || token.append && !last || token.index < 0 {
+				return nil, false
+			}
+			itemIndex := token.index
+			if token.append {
+				itemIndex = len(cur.Content)
+			}
+			out = append(out, indexSeg(itemIndex))
+			if last {
+				continue
+			}
+			if itemIndex >= len(cur.Content) {
+				return nil, false
+			}
+			cur = cur.Content[itemIndex]
+		default:
+			return nil, false
+		}
+	}
+	return out, true
 }
 
 // --- Operations ---
 
 func opTest(start *yaml.Node, tokens []ptrToken, expectRaw json.RawMessage) error {
+	if len(tokens) == 0 {
+		expect, err := decodeJSONValue(expectRaw)
+		if err != nil {
+			return fmt.Errorf("yamledit: test: %w", err)
+		}
+		if !deepEqual(yamlNodeToInterface(start), jsonValueToOrdered(expect)) {
+			return errors.New("yamledit: test operation failed at document root")
+		}
+		return nil
+	}
 	parent, last, err := resolveParent(start, tokens, false)
 	if err != nil {
 		return err
 	}
 	var target *yaml.Node
-	if last.isIdx {
-		if parent.Kind != yaml.SequenceNode {
-			return errors.New("yamledit: test: parent is not an array")
+	if parent.Kind == yaml.SequenceNode {
+		if !last.isIdx {
+			return errors.New("yamledit: test: invalid array index")
 		}
 		if last.append {
 			return errors.New("yamledit: test: '-' not allowed")
@@ -436,12 +759,9 @@ func opTest(start *yaml.Node, tokens []ptrToken, expectRaw json.RawMessage) erro
 			return fmt.Errorf("yamledit: test: index %d out of bounds", last.index)
 		}
 		target = parent.Content[last.index]
-	} else {
-		if parent.Kind != yaml.MappingNode {
-			return errors.New("yamledit: test: parent is not a mapping")
-		}
-		for i := 0; i+1 < len(parent.Content); i += 2 {
-			if parent.Content[i].Kind == yaml.ScalarNode && parent.Content[i].Value == last.key {
+	} else if parent.Kind == yaml.MappingNode {
+		for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+			if isStringMappingKey(parent.Content[i], last.key) {
 				target = parent.Content[i+1]
 				break
 			}
@@ -449,6 +769,8 @@ func opTest(start *yaml.Node, tokens []ptrToken, expectRaw json.RawMessage) erro
 		if target == nil {
 			return fmt.Errorf("yamledit: test: key %q not found", last.key)
 		}
+	} else {
+		return errors.New("yamledit: test: parent is not a container")
 	}
 
 	got := yamlNodeToInterface(target)
@@ -464,15 +786,19 @@ func opTest(start *yaml.Node, tokens []ptrToken, expectRaw json.RawMessage) erro
 	}
 	return nil
 }
-func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, tokens []ptrToken, raw json.RawMessage) error {
+func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []ptrToken, tokens []ptrToken, raw json.RawMessage) error {
 	if len(tokens) == 0 {
 		return errors.New("yamledit: add: empty path not supported")
 	}
 
-	parent, last, err := resolveParent(start, tokens, true)
+	// RFC 6902 requires the target's parent to exist. Creating missing
+	// intermediate objects both violates that rule and can leave mutations
+	// behind when a later path segment is invalid.
+	parent, last, err := resolveParent(start, tokens, false)
 	if err != nil {
 		return err
 	}
+	destinationPath, hasDestinationPath := logicalPatchPathSegments(start, basePath, tokens)
 
 	// decode value
 	v, err := decodeJSONValue(raw)
@@ -485,24 +811,22 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, 
 	// ---------------------------------------------------------------------
 	// Array add: parent is a sequence, last is an index or append
 	// ---------------------------------------------------------------------
-	if last.isIdx {
-		if parent.Kind != yaml.SequenceNode {
-			return errors.New("yamledit: add: parent is not an array")
+	if parent.Kind == yaml.SequenceNode {
+		if !last.isIdx {
+			return errors.New("yamledit: add: invalid array index")
 		}
-
 		if last.append {
 			// Append at end
 			parent.Content = append(parent.Content, yval)
 
 			if st != nil {
-				st.mu.Lock()
 				absTokens := appendPathTokens(basePath, tokens)
 				// Append in ordered view
-				st.ordered, _ = orderedAddArray(st.ordered, absTokens, orderedVal, true)
-
-				// Arrays typically require rewrite support depending on later marshal path.
-				st.arraysDirty = true
-				st.mu.Unlock()
+				updated, updateErr := orderedAddArray(st.ordered, absTokens, orderedVal, true)
+				if updateErr != nil {
+					return fmt.Errorf("yamledit: add: update ordered array: %w", updateErr)
+				}
+				st.ordered = updated
 			}
 			return nil
 		}
@@ -516,13 +840,16 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, 
 		parent.Content[last.index] = yval
 
 		if st != nil {
-			st.mu.Lock()
 			absTokens := appendPathTokens(basePath, tokens)
 			// orderedAddArray handles non-append insert too (appendMode=false)
-			st.ordered, _ = orderedAddArray(st.ordered, absTokens, orderedVal, false)
-
-			st.arraysDirty = true
-			st.mu.Unlock()
+			updated, updateErr := orderedAddArray(st.ordered, absTokens, orderedVal, false)
+			if updateErr != nil {
+				return fmt.Errorf("yamledit: add: update ordered array: %w", updateErr)
+			}
+			st.ordered = updated
+			if hasDestinationPath && len(destinationPath) > 0 {
+				rebaseDeletionMarkersForSequence(st, destinationPath[:len(destinationPath)-1], last.index, 1, false)
+			}
 		}
 		return nil
 	}
@@ -540,8 +867,14 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, 
 	switch vv := orderedVal.(type) {
 	case int:
 		upsertScalarKey(parent, last.key, "!!int", strconv.Itoa(vv))
+	case json.Number:
+		tag := "!!int"
+		if strings.ContainsAny(string(vv), ".eE") {
+			tag = "!!float"
+		}
+		upsertScalarKey(parent, last.key, tag, string(vv))
 	case float64:
-		upsertScalarKey(parent, last.key, "!!float", strconv.FormatFloat(vv, 'g', -1, 64))
+		upsertScalarKey(parent, last.key, "!!float", formatYAMLFloat(vv))
 	case bool:
 		if vv {
 			upsertScalarKey(parent, last.key, "!!bool", "true")
@@ -555,20 +888,35 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, 
 	default:
 		// Complex insert (map/array)
 		replaced := false
-		for i := 0; i+1 < len(parent.Content); i += 2 {
+		for i := len(parent.Content) - 2; i >= 0; i -= 2 {
 			k := parent.Content[i]
-			if k.Kind == yaml.ScalarNode && k.Value == last.key {
+			if isStringMappingKey(k, last.key) {
 				old := parent.Content[i+1]
-				parent.Content[i+1] = yval
+				oldKind := yaml.Kind(0)
+				oldLineComment := ""
+				if old != nil {
+					oldKind = old.Kind
+					oldLineComment = old.LineComment
+					yval.Anchor = old.Anchor
+					if old.Anchor != "" {
+						*old = *yval
+					} else {
+						parent.Content[i+1] = yval
+					}
+				} else {
+					parent.Content[i+1] = yval
+				}
 
 				// If we replaced a scalar with a complex value, move inline comment onto key line.
-				if old != nil && old.Kind == yaml.ScalarNode &&
+				if old != nil && oldKind == yaml.ScalarNode &&
 					(yval.Kind == yaml.MappingNode || yval.Kind == yaml.SequenceNode) {
-					if c := strings.TrimSpace(old.LineComment); c != "" {
+					if c := strings.TrimSpace(oldLineComment); c != "" {
 						if parent.Content[i].LineComment == "" {
-							parent.Content[i].LineComment = old.LineComment
+							parent.Content[i].LineComment = oldLineComment
 						}
-						old.LineComment = ""
+						if old != nil {
+							old.LineComment = ""
+						}
 					}
 				}
 
@@ -584,18 +932,16 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, 
 
 	// Update ordered view by ptrToken path (works through sequences too).
 	if st != nil {
-		st.mu.Lock()
-		defer st.mu.Unlock()
-
 		absTokens := appendPathTokens(basePath, tokens)
 
 		// Upsert into ordered view (final key may be new)
 		if nv, err := orderedUpsertAtPathTokens(st.ordered, absTokens, orderedVal); err == nil {
 			st.ordered = nv
 		} else {
-			// If ordered view can't be updated, marshal cannot safely do minimal diffs.
-			st.structuralDirty = true
-			return nil
+			return fmt.Errorf("yamledit: add: update ordered mapping: %w", err)
+		}
+		if hasDestinationPath {
+			clearDeletionMarkersAtOrBelow(st, destinationPath)
 		}
 
 		// Any add that traverses an array index generally requires structural rewrite support,
@@ -612,7 +958,7 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []string, 
 	return nil
 }
 
-func opRemove(start *yaml.Node, st *docState, baseFromRoot []string, tokens []ptrToken) error {
+func opRemove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []ptrToken, tokens []ptrToken) error {
 	if len(tokens) == 0 {
 		return errors.New("yamledit: remove: empty path not supported")
 	}
@@ -620,9 +966,10 @@ func opRemove(start *yaml.Node, st *docState, baseFromRoot []string, tokens []pt
 	if err != nil {
 		return err
 	}
-	if last.isIdx {
-		if parent.Kind != yaml.SequenceNode {
-			return errors.New("yamledit: remove: parent is not an array")
+	removedPath, hasRemovedPath := logicalPatchPathSegments(start, baseFromRoot, tokens)
+	if parent.Kind == yaml.SequenceNode {
+		if !last.isIdx {
+			return errors.New("yamledit: remove: invalid array index")
 		}
 		if last.append {
 			return errors.New("yamledit: remove: '-' not allowed")
@@ -630,24 +977,64 @@ func opRemove(start *yaml.Node, st *docState, baseFromRoot []string, tokens []pt
 		if last.index < 0 || last.index >= len(parent.Content) {
 			return fmt.Errorf("yamledit: remove: index %d out of bounds", last.index)
 		}
+		target := parent.Content[last.index]
+		if removalWouldBreakAlias(patchAliasScanRoot(start, docHN), target) {
+			return errors.New("yamledit: remove: value defines an anchor that is still referenced")
+		}
 		parent.Content = append(parent.Content[:last.index], parent.Content[last.index+1:]...)
 		if st != nil {
-			st.mu.Lock()
 			absTokens := appendPathTokens(baseFromRoot, tokens)
-			st.ordered, _ = orderedRemoveArray(st.ordered, absTokens)
-			st.arraysDirty = true
-			st.mu.Unlock()
+			var updateErr error
+			st.ordered, updateErr = orderedRemoveAtPathTokens(st.ordered, absTokens)
+			if updateErr != nil {
+				return fmt.Errorf("yamledit: remove: update ordered array: %w", updateErr)
+			}
+			if hasRemovedPath && len(removedPath) > 0 {
+				rebaseDeletionMarkersForSequence(st, removedPath[:len(removedPath)-1], last.index, -1, true)
+			}
 		}
 		return nil
 	}
 	if parent.Kind != yaml.MappingNode {
 		return errors.New("yamledit: remove: parent is not a mapping")
 	}
-	DeleteKey(parent, last.key)
+	found := false
+	targets := make([]*yaml.Node, 0, 2)
+	content := make([]*yaml.Node, 0, len(parent.Content))
+	for i := 0; i+1 < len(parent.Content); i += 2 {
+		if isStringMappingKey(parent.Content[i], last.key) {
+			found = true
+			targets = append(targets, parent.Content[i], parent.Content[i+1])
+			continue
+		}
+		content = append(content, parent.Content[i], parent.Content[i+1])
+	}
+	if !found {
+		return fmt.Errorf("yamledit: remove: key %q not found", last.key)
+	}
+	if removalWouldBreakAlias(patchAliasScanRoot(start, docHN), targets...) {
+		return errors.New("yamledit: remove: member contains an anchor that is still referenced")
+	}
+	parent.Content = content
+	if st != nil {
+		absTokens := appendPathTokens(baseFromRoot, tokens)
+		var updateErr error
+		st.ordered, updateErr = orderedRemoveAtPathTokens(st.ordered, absTokens)
+		if updateErr != nil {
+			return fmt.Errorf("yamledit: remove: update ordered map: %w", updateErr)
+		}
+	}
 	return nil
 }
 
-func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []string, tokens []ptrToken, raw json.RawMessage) error {
+func patchAliasScanRoot(start, docHN *yaml.Node) *yaml.Node {
+	if docHN != nil && docHN.Kind == yaml.DocumentNode && len(docHN.Content) > 0 {
+		return docHN.Content[0]
+	}
+	return start
+}
+
+func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []ptrToken, tokens []ptrToken, raw json.RawMessage) error {
 	if len(tokens) == 0 {
 		return errors.New("yamledit: replace: empty path not supported")
 	}
@@ -656,6 +1043,7 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 	if err != nil {
 		return err
 	}
+	destinationPath, hasDestinationPath := logicalPatchPathSegments(start, baseFromRoot, tokens)
 	v, err := decodeJSONValue(raw)
 	if err != nil {
 		return err
@@ -663,9 +1051,9 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 	orderedVal := jsonValueToOrdered(v)
 	yval := jsonValueToYAMLNode(orderedVal)
 
-	if last.isIdx {
-		if parent.Kind != yaml.SequenceNode {
-			return errors.New("yamledit: replace: parent is not an array")
+	if parent.Kind == yaml.SequenceNode {
+		if !last.isIdx {
+			return errors.New("yamledit: replace: invalid array index")
 		}
 		if last.append {
 			return errors.New("yamledit: replace: '-' not allowed")
@@ -673,45 +1061,96 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 		if last.index < 0 || last.index >= len(parent.Content) {
 			return fmt.Errorf("yamledit: replace: index %d out of bounds", last.index)
 		}
-		parent.Content[last.index] = yval
+		old := parent.Content[last.index]
+		if old != nil {
+			yval.HeadComment = old.HeadComment
+			yval.LineComment = old.LineComment
+			yval.FootComment = old.FootComment
+		}
+		if old != nil && old.Anchor != "" {
+			yval.Anchor = old.Anchor
+			*old = *yval
+		} else {
+			if old != nil {
+				yval.Anchor = old.Anchor
+			}
+			parent.Content[last.index] = yval
+		}
 		if st != nil {
-			st.mu.Lock()
 			absTokens := appendPathTokens(baseFromRoot, tokens)
-			st.ordered, _ = orderedReplaceArray(st.ordered, absTokens, orderedVal)
-			st.arraysDirty = true
-			st.mu.Unlock()
+			var updateErr error
+			st.ordered, updateErr = orderedSetAtPathTokens(st.ordered, absTokens, orderedVal)
+			if updateErr != nil {
+				return fmt.Errorf("yamledit: replace: update ordered array: %w", updateErr)
+			}
+			if hasDestinationPath {
+				clearDeletionMarkersAtOrBelow(st, destinationPath)
+			}
 		}
 		return nil
 	}
 	if parent.Kind != yaml.MappingNode {
 		return errors.New("yamledit: replace: parent is not a mapping")
 	}
+	foundKey := false
+	for i := 0; i+1 < len(parent.Content); i += 2 {
+		if isStringMappingKey(parent.Content[i], last.key) {
+			foundKey = true
+			break
+		}
+	}
+	if !foundKey {
+		return fmt.Errorf("yamledit: replace: key %q not found", last.key)
+	}
 	// choose surgical replacements for scalars
 	switch vv := orderedVal.(type) {
 	case int:
-		SetScalarInt(parent, last.key, vv)
+		upsertScalarKey(parent, last.key, "!!int", strconv.Itoa(vv))
+	case json.Number:
+		tag := "!!int"
+		if strings.ContainsAny(string(vv), ".eE") {
+			tag = "!!float"
+		}
+		upsertScalarKey(parent, last.key, tag, string(vv))
 	case float64:
-		SetScalarFloat(parent, last.key, vv)
+		upsertScalarKey(parent, last.key, "!!float", formatYAMLFloat(vv))
 	case bool:
-		SetScalarBool(parent, last.key, vv)
+		if vv {
+			upsertScalarKey(parent, last.key, "!!bool", "true")
+		} else {
+			upsertScalarKey(parent, last.key, "!!bool", "false")
+		}
 	case string:
-		SetScalarString(parent, last.key, vv)
+		upsertScalarKey(parent, last.key, "!!str", vv)
 	case nil:
-		SetScalarNull(parent, last.key)
+		upsertScalarKey(parent, last.key, "!!null", "null")
 	default:
 		// complex (map/array)
 		var oldChild *yaml.Node
 		found := false
-		for i := 0; i+1 < len(parent.Content); i += 2 {
-			if parent.Content[i].Kind == yaml.ScalarNode && parent.Content[i].Value == last.key {
+		for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+			if isStringMappingKey(parent.Content[i], last.key) {
 				// Remember previous value before we swap it out
 				oldChild = parent.Content[i+1]
-				parent.Content[i+1] = yval
+				oldKind := yaml.Kind(0)
+				oldLineComment := ""
+				if oldChild != nil {
+					oldKind = oldChild.Kind
+					oldLineComment = oldChild.LineComment
+					yval.Anchor = oldChild.Anchor
+					if oldChild.Anchor != "" {
+						*oldChild = *yval
+					} else {
+						parent.Content[i+1] = yval
+					}
+				} else {
+					parent.Content[i+1] = yval
+				}
 				// If old value was scalar and new is complex, keep the inline comment on the *key* line
-				if oldChild != nil && oldChild.Kind == yaml.ScalarNode && (yval.Kind == yaml.MappingNode || yval.Kind == yaml.SequenceNode) {
-					if c := strings.TrimSpace(oldChild.LineComment); c != "" {
+				if oldChild != nil && oldKind == yaml.ScalarNode && (yval.Kind == yaml.MappingNode || yval.Kind == yaml.SequenceNode) {
+					if c := strings.TrimSpace(oldLineComment); c != "" {
 						if parent.Content[i].LineComment == "" {
-							parent.Content[i].LineComment = oldChild.LineComment
+							parent.Content[i].LineComment = oldLineComment
 						}
 						oldChild.LineComment = ""
 					}
@@ -723,154 +1162,372 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 		if !found {
 			return fmt.Errorf("yamledit: replace: key %q not found", last.key)
 		}
-		if st != nil {
-			st.mu.Lock()
-			if _, ok := st.subPathByHN[parent]; !ok && docHN != nil {
-				indexMappingHandles(st, docHN.Content[0], nil)
-			}
-			path := st.subPathByHN[parent]
-			st.ordered = setAnyAtPath(st.ordered, path, last.key, orderedVal)
-			// If we are replacing a sequence (array) value and its "shape" changed,
-			// force structured re-encode to avoid byte-surgical scrambling.
-			if yval.Kind == yaml.SequenceNode {
-				shapeChanged := true // default to conservative
-				if oldChild != nil && oldChild.Kind == yaml.SequenceNode {
-					// length change → definitely shape change
-					if len(oldChild.Content) == len(yval.Content) {
-						// Try to compare item identities by their "name" field (if present)
-						if oldNames, ok1 := seqItemNames(oldChild); ok1 {
-							if newNames, ok2 := seqItemNames(yval); ok2 {
-								shapeChanged = false
-								for i := range oldNames {
-									if oldNames[i] != newNames[i] {
-										shapeChanged = true
-										break
-									}
-								}
-							}
-						}
-					}
-				}
-				if shapeChanged {
-					st.arraysDirty = true
-				}
-			}
-			st.mu.Unlock()
-		}
 	}
 	// Ensure the ordered view also reflects scalar updates inside sequence items.
 	// This handles cases where 'parent' is a mapping within an array and therefore
 	// lacks a handle → path entry in subPathByHN.
 	if st != nil {
-		st.mu.Lock()
 		absTokens := appendPathTokens(baseFromRoot, tokens)
-		if nv, err := orderedSetAtPathTokens(st.ordered, absTokens, orderedVal); err == nil {
-			st.ordered = nv
+		nv, updateErr := orderedSetAtPathTokens(st.ordered, absTokens, orderedVal)
+		if updateErr != nil {
+			return fmt.Errorf("yamledit: replace: update ordered value: %w", updateErr)
 		}
-		st.mu.Unlock()
+		st.ordered = nv
+		if hasDestinationPath {
+			clearDeletionMarkersAtOrBelow(st, destinationPath)
+		}
 	}
 	return nil
 }
 
-func opMove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []string, from, to string) error {
-	fromToks, err := parseJSONPointer(from)
+func opMove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []ptrToken, fromToks, toToks []ptrToken) error {
+	src, err := nodeAtPatchPath(start, fromToks, "move")
 	if err != nil {
 		return err
 	}
-	toToks, err := parseJSONPointer(to)
+	if ptrTokensEqual(fromToks, toToks) {
+		return nil
+	}
+	if ptrTokensHavePrefix(toToks, fromToks) {
+		return errors.New("yamledit: move: destination cannot be a child of source")
+	}
+	keyNode, err := mappingKeyAtPatchPath(start, fromToks)
 	if err != nil {
 		return err
 	}
-	// read value at 'from'
-	srcParent, srcLast, err := resolveParent(start, appendPathTokens(baseFromRoot, fromToks), false)
-	if err != nil {
+	if yamlNodeHasNonJSONMetadata(src) || yamlNodeHasNonJSONMetadata(keyNode) {
+		return errors.New("yamledit: move: source contains YAML metadata that cannot be preserved")
+	}
+	if err := validateMoveDestination(start, fromToks, toToks); err != nil {
 		return err
 	}
-	var src *yaml.Node
-	if srcLast.isIdx {
-		if srcParent.Kind != yaml.SequenceNode || srcLast.index < 0 || srcLast.index >= len(srcParent.Content) {
-			return errors.New("yamledit: move: invalid 'from' index")
-		}
-		src = srcParent.Content[srcLast.index]
-	} else {
-		if srcParent.Kind != yaml.MappingNode {
-			return errors.New("yamledit: move: invalid 'from' parent")
-		}
-		for i := 0; i+1 < len(srcParent.Content); i += 2 {
-			if srcParent.Content[i].Kind == yaml.ScalarNode && srcParent.Content[i].Value == srcLast.key {
-				src = srcParent.Content[i+1]
-				break
-			}
-		}
-		if src == nil {
-			return fmt.Errorf("yamledit: move: key %q not found", srcLast.key)
-		}
+	raw := mustMarshalJSON(yamlNodeToInterface(src))
+	if raw == nil {
+		return errors.New("yamledit: move: source is not JSON-compatible")
 	}
-	// clone
-	cl := *src
-	// add to 'to'
-	if err := opAdd(start, st, docHN, baseFromRoot, toToks, mustMarshalJSON(yamlNodeToInterface(&cl))); err != nil {
+
+	// RFC 6902 defines move as remove followed by add. The order matters when
+	// moving forward within the same array because the removal shifts indices.
+	if err := opRemove(start, st, docHN, baseFromRoot, fromToks); err != nil {
 		return err
 	}
-	// remove from 'from'
-	return opRemove(start, st, baseFromRoot, fromToks)
+	return opAdd(start, st, docHN, baseFromRoot, toToks, raw)
 }
 
-func opCopy(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []string, from, to string) error {
-	fromToks, err := parseJSONPointer(from)
+func mappingKeyAtPatchPath(start *yaml.Node, tokens []ptrToken) (*yaml.Node, error) {
+	parent, last, err := resolveParent(start, tokens, false)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	toToks, err := parseJSONPointer(to)
-	if err != nil {
-		return err
+	if parent.Kind != yaml.MappingNode {
+		return nil, nil
 	}
-	// read value at 'from'
-	srcParent, srcLast, err := resolveParent(start, appendPathTokens(baseFromRoot, fromToks), false)
-	if err != nil {
-		return err
-	}
-	var src *yaml.Node
-	if srcLast.isIdx {
-		if srcParent.Kind != yaml.SequenceNode || srcLast.index < 0 || srcLast.index >= len(srcParent.Content) {
-			return errors.New("yamledit: copy: invalid 'from' index")
+	for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+		if isStringMappingKey(parent.Content[i], last.key) {
+			return parent.Content[i], nil
 		}
-		src = srcParent.Content[srcLast.index]
-	} else {
-		if srcParent.Kind != yaml.MappingNode {
-			return errors.New("yamledit: copy: invalid 'from' parent")
+	}
+	return nil, fmt.Errorf("yamledit: move: key %q not found", last.key)
+}
+
+func validateMoveDestination(start *yaml.Node, fromToks, toToks []ptrToken) error {
+	sourceParent, sourceLast, err := resolveParent(start, fromToks, false)
+	if err != nil {
+		return err
+	}
+	removedIndex := -1
+	if sourceParent.Kind == yaml.SequenceNode && sourceLast.isIdx && !sourceLast.append {
+		removedIndex = sourceLast.index
+	}
+	destinationParent, destinationLast, err := resolveParentForAddValidationAfterRemoval(start, toToks, sourceParent, removedIndex)
+	if err != nil {
+		return err
+	}
+	if destinationParent == nil || destinationParent.Kind == yaml.MappingNode {
+		return nil
+	}
+	if destinationParent.Kind != yaml.SequenceNode {
+		return errors.New("yamledit: move: destination parent is not a container")
+	}
+	if destinationLast.append {
+		return nil
+	}
+	if !destinationLast.isIdx {
+		return errors.New("yamledit: move: invalid destination array index")
+	}
+	max := len(destinationParent.Content)
+	if sourceParent == destinationParent {
+		max--
+	}
+	if destinationLast.index < 0 || destinationLast.index > max {
+		return fmt.Errorf("yamledit: move: destination index %d out of bounds", destinationLast.index)
+	}
+	return nil
+}
+
+func resolveParentForAddValidation(start *yaml.Node, tokens []ptrToken) (*yaml.Node, ptrToken, error) {
+	return resolveParentForAddValidationAfterRemoval(start, tokens, nil, -1)
+}
+
+func resolveParentForAddValidationAfterRemoval(start *yaml.Node, tokens []ptrToken, removedFrom *yaml.Node, removedIndex int) (*yaml.Node, ptrToken, error) {
+	if len(tokens) == 0 {
+		return nil, ptrToken{}, errors.New("yamledit: add: empty path not supported")
+	}
+	cur := start
+	if cur.Kind == yaml.DocumentNode {
+		if len(cur.Content) == 0 {
+			return nil, ptrToken{}, errors.New("yamledit: document has no root")
 		}
-		for i := 0; i+1 < len(srcParent.Content); i += 2 {
-			if srcParent.Content[i].Kind == yaml.ScalarNode && srcParent.Content[i].Value == srcLast.key {
-				src = srcParent.Content[i+1]
-				break
+		cur = cur.Content[0]
+	}
+	virtualMap := false
+	for i := 0; i < len(tokens)-1; i++ {
+		token := tokens[i]
+		if virtualMap {
+			continue
+		}
+		switch cur.Kind {
+		case yaml.MappingNode:
+			if hasNonStringMappingKeyNamed(cur, token.key) {
+				return nil, ptrToken{}, fmt.Errorf("yamledit: path %q collides with a non-string YAML key", token.key)
 			}
-		}
-		if src == nil {
-			return fmt.Errorf("yamledit: copy: key %q not found", srcLast.key)
+			var child *yaml.Node
+			for j := len(cur.Content) - 2; j >= 0; j -= 2 {
+				if isStringMappingKey(cur.Content[j], token.key) {
+					child = cur.Content[j+1]
+					break
+				}
+			}
+			if child == nil {
+				// opAdd's documented extension creates missing mapping parents.
+				virtualMap = true
+				continue
+			}
+			cur = child
+		case yaml.SequenceNode:
+			index := token.index
+			limit := len(cur.Content)
+			if cur == removedFrom && removedIndex >= 0 {
+				limit--
+				if index >= removedIndex {
+					index++
+				}
+			}
+			if !token.isIdx || token.append || token.index < 0 || token.index >= limit || index >= len(cur.Content) {
+				return nil, ptrToken{}, fmt.Errorf("yamledit: add: invalid array index at segment %d", i)
+			}
+			cur = cur.Content[index]
+		default:
+			return nil, ptrToken{}, fmt.Errorf("yamledit: add: cannot traverse node at segment %d", i)
 		}
 	}
-	// add to 'to'
-	return opAdd(start, st, docHN, baseFromRoot, toToks, mustMarshalJSON(yamlNodeToInterface(src)))
+	if virtualMap {
+		return nil, tokens[len(tokens)-1], nil
+	}
+	last := tokens[len(tokens)-1]
+	if cur != nil && cur.Kind == yaml.MappingNode && hasNonStringMappingKeyNamed(cur, last.key) {
+		return nil, ptrToken{}, fmt.Errorf("yamledit: path %q collides with a non-string YAML key", last.key)
+	}
+	return cur, last, nil
+}
+
+func opCopy(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []ptrToken, fromToks, toToks []ptrToken) error {
+	src, err := nodeAtPatchPath(start, fromToks, "copy")
+	if err != nil {
+		return err
+	}
+	if yamlNodeHasNonJSONType(src) {
+		return errors.New("yamledit: copy: source is not JSON-compatible")
+	}
+	raw := mustMarshalJSON(yamlNodeToInterface(src))
+	if raw == nil {
+		return errors.New("yamledit: copy: source is not JSON-compatible")
+	}
+	return opAdd(start, st, docHN, baseFromRoot, toToks, raw)
+}
+
+func nodeAtPatchPath(start *yaml.Node, tokens []ptrToken, op string) (*yaml.Node, error) {
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("yamledit: %s: empty 'from' path not supported", op)
+	}
+	parent, last, err := resolveParent(start, tokens, false)
+	if err != nil {
+		return nil, err
+	}
+	if parent.Kind == yaml.SequenceNode {
+		if !last.isIdx || last.append || last.index < 0 || last.index >= len(parent.Content) {
+			return nil, fmt.Errorf("yamledit: %s: invalid 'from' index", op)
+		}
+		return parent.Content[last.index], nil
+	}
+	if parent.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("yamledit: %s: invalid 'from' parent", op)
+	}
+	for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+		if isStringMappingKey(parent.Content[i], last.key) {
+			return parent.Content[i+1], nil
+		}
+	}
+	return nil, fmt.Errorf("yamledit: %s: key %q not found", op, last.key)
+}
+
+func ptrTokensEqual(a, b []ptrToken) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].key != b[i].key || a[i].isIdx != b[i].isIdx || a[i].index != b[i].index || a[i].append != b[i].append {
+			return false
+		}
+	}
+	return true
+}
+
+func ptrTokensHavePrefix(path, prefix []ptrToken) bool {
+	return len(path) > len(prefix) && ptrTokensEqual(path[:len(prefix)], prefix)
 }
 
 func mustMarshalJSON(v interface{}) json.RawMessage {
-	b, _ := json.Marshal(v)
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
 	return b
 }
 
 func deepEqual(a, b interface{}) bool {
-	// simple reflect.DeepEqual would work; keep types aligned by our conversions
-	return fmt.Sprintf("%#v", a) == fmt.Sprintf("%#v", b)
+	a = toPlain(a)
+	b = toPlain(b)
+	if an, ok := canonicalDecimal(a); ok {
+		bn, bok := canonicalDecimal(b)
+		return bok && an == bn
+	}
+	switch av := a.(type) {
+	case map[string]interface{}:
+		bv, ok := b.(map[string]interface{})
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for key, value := range av {
+			other, exists := bv[key]
+			if !exists || !deepEqual(value, other) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		bv, ok := b.([]interface{})
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !deepEqual(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
+type normalizedDecimal struct {
+	negative bool
+	digits   string
+	scale    int64
+}
+
+func canonicalDecimal(v interface{}) (normalizedDecimal, bool) {
+	var decimal string
+	switch n := v.(type) {
+	case json.Number:
+		decimal = string(n)
+	case int:
+		decimal = strconv.Itoa(n)
+	case int8:
+		decimal = strconv.FormatInt(int64(n), 10)
+	case int16:
+		decimal = strconv.FormatInt(int64(n), 10)
+	case int32:
+		decimal = strconv.FormatInt(int64(n), 10)
+	case int64:
+		decimal = strconv.FormatInt(n, 10)
+	case uint:
+		decimal = strconv.FormatUint(uint64(n), 10)
+	case uint8:
+		decimal = strconv.FormatUint(uint64(n), 10)
+	case uint16:
+		decimal = strconv.FormatUint(uint64(n), 10)
+	case uint32:
+		decimal = strconv.FormatUint(uint64(n), 10)
+	case uint64:
+		decimal = strconv.FormatUint(n, 10)
+	case float32:
+		decimal = strconv.FormatFloat(float64(n), 'g', -1, 32)
+	case float64:
+		decimal = strconv.FormatFloat(n, 'g', -1, 64)
+	default:
+		return normalizedDecimal{}, false
+	}
+	return normalizeDecimalNumber(decimal)
+}
+
+func normalizeDecimalNumber(s string) (normalizedDecimal, bool) {
+	if s == "" {
+		return normalizedDecimal{}, false
+	}
+	negative := false
+	if s[0] == '-' || s[0] == '+' {
+		negative = s[0] == '-'
+		s = s[1:]
+	}
+	var exponent int64
+	if pos := strings.IndexAny(s, "eE"); pos >= 0 {
+		parsed, err := strconv.ParseInt(s[pos+1:], 10, 64)
+		if err != nil {
+			return normalizedDecimal{}, false
+		}
+		exponent = parsed
+		s = s[:pos]
+	}
+	var fractionDigits int64
+	if dot := strings.IndexByte(s, '.'); dot >= 0 {
+		fractionDigits = int64(len(s) - dot - 1)
+		s = s[:dot] + s[dot+1:]
+	}
+	if s == "" {
+		return normalizedDecimal{}, false
+	}
+	for _, digit := range s {
+		if digit < '0' || digit > '9' {
+			return normalizedDecimal{}, false
+		}
+	}
+	s = strings.TrimLeft(s, "0")
+	if s == "" {
+		return normalizedDecimal{digits: "0"}, true
+	}
+	trailing := int64(len(s) - len(strings.TrimRight(s, "0")))
+	if trailing > 0 {
+		s = s[:len(s)-int(trailing)]
+	}
+	// Check both arithmetic steps for overflow without allocating a power of ten.
+	if fractionDigits > 0 && exponent < -1*(1<<63)+fractionDigits {
+		return normalizedDecimal{}, false
+	}
+	scale := exponent - fractionDigits
+	if trailing > 0 && scale > (1<<63)-1-trailing {
+		return normalizedDecimal{}, false
+	}
+	scale += trailing
+	return normalizedDecimal{negative: negative, digits: s, scale: scale}, true
 }
 
 // --- Ordered updates for arrays (best-effort for fallback encoder) ---
 
-func appendPathTokens(prefix []string, toks []ptrToken) []ptrToken {
+func appendPathTokens(prefix []ptrToken, toks []ptrToken) []ptrToken {
 	out := make([]ptrToken, 0, len(prefix)+len(toks))
-	for _, k := range prefix {
-		out = append(out, ptrToken{key: k})
-	}
+	out = append(out, prefix...)
 	out = append(out, toks...)
 	return out
 }
@@ -920,6 +1577,92 @@ func orderedRemoveArray(ms gyaml.MapSlice, path []ptrToken) (gyaml.MapSlice, err
 	})
 }
 
+// orderedRemoveAtPathTokens removes either a mapping member or a sequence item,
+// interpreting numeric tokens according to the container being traversed.
+func orderedRemoveAtPathTokens(ms gyaml.MapSlice, path []ptrToken) (gyaml.MapSlice, error) {
+	if len(path) == 0 {
+		return ms, errors.New("orderedRemoveAtPath: empty path")
+	}
+
+	var recur func(interface{}, int) (interface{}, error)
+	recur = func(cur interface{}, depth int) (interface{}, error) {
+		t := path[depth]
+		switch v := cur.(type) {
+		case gyaml.MapSlice:
+			found := -1
+			for i := len(v) - 1; i >= 0; i-- {
+				if keyEquals(v[i].Key, t.key) {
+					found = i
+					break
+				}
+			}
+			if found < 0 {
+				return nil, fmt.Errorf("orderedRemoveAtPath: key %q not found", t.key)
+			}
+			if depth == len(path)-1 {
+				out := make(gyaml.MapSlice, 0, len(v)-1)
+				for _, item := range v {
+					if !keyEquals(item.Key, t.key) {
+						out = append(out, item)
+					}
+				}
+				return out, nil
+			}
+			next, err := recur(v[found].Value, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[found].Value = next
+			return v, nil
+
+		case map[string]interface{}:
+			child, ok := v[t.key]
+			if !ok {
+				return nil, fmt.Errorf("orderedRemoveAtPath: key %q not found", t.key)
+			}
+			if depth == len(path)-1 {
+				delete(v, t.key)
+				return v, nil
+			}
+			next, err := recur(child, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[t.key] = next
+			return v, nil
+
+		case []interface{}:
+			if !t.isIdx || t.append {
+				return nil, fmt.Errorf("orderedRemoveAtPath: invalid array index at segment %d", depth)
+			}
+			if t.index < 0 || t.index >= len(v) {
+				return nil, fmt.Errorf("orderedRemoveAtPath: index %d out of bounds", t.index)
+			}
+			if depth == len(path)-1 {
+				return append(v[:t.index], v[t.index+1:]...), nil
+			}
+			next, err := recur(v[t.index], depth+1)
+			if err != nil {
+				return nil, err
+			}
+			v[t.index] = next
+			return v, nil
+		default:
+			return nil, fmt.Errorf("orderedRemoveAtPath: unexpected type at segment %d (%T)", depth, cur)
+		}
+	}
+
+	out, err := recur(ms, 0)
+	if err != nil {
+		return ms, err
+	}
+	res, ok := out.(gyaml.MapSlice)
+	if !ok {
+		return ms, fmt.Errorf("orderedRemoveAtPath: root type changed (%T)", out)
+	}
+	return res, nil
+}
+
 // orderedArrayEdit navigates to the []interface{} pointed by path (last segment is an index/appender)
 // and applies 'edit', returning an updated MapSlice.
 func orderedArrayEdit(ms gyaml.MapSlice, path []ptrToken, edit func([]interface{}) ([]interface{}, error)) (gyaml.MapSlice, error) {
@@ -931,12 +1674,9 @@ func orderedArrayEdit(ms gyaml.MapSlice, path []ptrToken, edit func([]interface{
 		t := path[depth]
 		switch v := cur.(type) {
 		case gyaml.MapSlice:
-			if t.isIdx {
-				return nil, fmt.Errorf("expected key at segment %d", depth)
-			}
 			// locate key
 			found := -1
-			for i := range v {
+			for i := len(v) - 1; i >= 0; i-- {
 				if keyEquals(v[i].Key, t.key) {
 					found = i
 					break
@@ -997,12 +1737,9 @@ func orderedSetAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface{})
 		t := path[depth]
 		switch v := cur.(type) {
 		case gyaml.MapSlice:
-			if t.isIdx {
-				return nil, fmt.Errorf("orderedSetAtPath: expected key at segment %d", depth)
-			}
 			// locate key
 			found := -1
-			for i := range v {
+			for i := len(v) - 1; i >= 0; i-- {
 				if keyEquals(v[i].Key, t.key) {
 					found = i
 					break
@@ -1025,9 +1762,6 @@ func orderedSetAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface{})
 
 		case map[string]interface{}:
 			// Handle native map as well (can occur inside []interface{}).
-			if t.isIdx {
-				return nil, fmt.Errorf("orderedSetAtPath: expected key at segment %d", depth)
-			}
 			child, ok := v[t.key]
 			if !ok {
 				return nil, fmt.Errorf("orderedSetAtPath: path key %q not found", t.key)
@@ -1076,36 +1810,6 @@ func orderedSetAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface{})
 	return res, nil
 }
 
-// seqItemNames extracts the "name" scalar from each mapping item in a sequence.
-// Returns (names, true) only if every item is a mapping and has a string scalar "name".
-func seqItemNames(seq *yaml.Node) ([]string, bool) {
-	// This function is used by opReplace (in the original file) to check shape change for mapping arrays.
-	// We keep its original behavior (only checks mappings) as the new hybrid surgery logic handles scalars separately.
-	if seq == nil || seq.Kind != yaml.SequenceNode {
-		return nil, false
-	}
-	out := make([]string, len(seq.Content))
-	for i, it := range seq.Content {
-		if it == nil || it.Kind != yaml.MappingNode {
-			return nil, false
-		}
-		found := false
-		for j := 0; j+1 < len(it.Content); j += 2 {
-			k := it.Content[j]
-			v := it.Content[j+1]
-			if k.Kind == yaml.ScalarNode && k.Value == "name" && v.Kind == yaml.ScalarNode {
-				out[i] = v.Value
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, false
-		}
-	}
-	return out, true
-}
-
 // orderedUpsertAtPathTokens sets a value at the path indicated by tokens.
 // Unlike orderedSetAtPathTokens, it will CREATE the final mapping key if missing.
 // Intermediate missing mapping keys are created as empty maps (gyaml.MapSlice{}),
@@ -1122,12 +1826,8 @@ func orderedUpsertAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface
 
 		switch v := cur.(type) {
 		case gyaml.MapSlice:
-			if t.isIdx {
-				return nil, fmt.Errorf("orderedUpsertAtPath: expected key at segment %d", depth)
-			}
-
 			found := -1
-			for i := range v {
+			for i := len(v) - 1; i >= 0; i-- {
 				if keyEquals(v[i].Key, t.key) {
 					found = i
 					break
@@ -1146,10 +1846,6 @@ func orderedUpsertAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface
 
 			// Intermediate segment: ensure container exists.
 			if found < 0 {
-				next := path[depth+1]
-				if next.isIdx {
-					return nil, fmt.Errorf("orderedUpsertAtPath: missing key %q before index segment", t.key)
-				}
 				v = append(v, gyaml.MapItem{Key: t.key, Value: gyaml.MapSlice{}})
 				found = len(v) - 1
 			}
@@ -1162,19 +1858,12 @@ func orderedUpsertAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface
 			return v, nil
 
 		case map[string]interface{}:
-			if t.isIdx {
-				return nil, fmt.Errorf("orderedUpsertAtPath: expected key at segment %d", depth)
-			}
 			if depth == len(path)-1 {
 				v[t.key] = ov
 				return v, nil
 			}
 			child, ok := v[t.key]
 			if !ok {
-				next := path[depth+1]
-				if next.isIdx {
-					return nil, fmt.Errorf("orderedUpsertAtPath: missing key %q before index segment", t.key)
-				}
 				child = map[string]interface{}{}
 				v[t.key] = child
 			}

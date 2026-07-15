@@ -2,8 +2,12 @@ package yamledit
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	gyaml "github.com/goccy/go-yaml"
 	"gopkg.in/yaml.v3"
@@ -41,6 +45,246 @@ func cloneSlice(in []interface{}) []interface{} {
 	return out
 }
 
+func validateOrderedUTF8(v interface{}) error {
+	switch value := v.(type) {
+	case string:
+		if !utf8.ValidString(value) {
+			return fmt.Errorf("yamledit: string value contains invalid UTF-8")
+		}
+	case gyaml.MapSlice:
+		for _, item := range value {
+			if key, ok := item.Key.(string); ok && !utf8.ValidString(key) {
+				return fmt.Errorf("yamledit: mapping key contains invalid UTF-8")
+			}
+			if err := validateOrderedUTF8(item.Value); err != nil {
+				return err
+			}
+		}
+	case []interface{}:
+		for _, item := range value {
+			if err := validateOrderedUTF8(item); err != nil {
+				return err
+			}
+		}
+	case map[string]interface{}:
+		for key, item := range value {
+			if !utf8.ValidString(key) {
+				return fmt.Errorf("yamledit: mapping key contains invalid UTF-8")
+			}
+			if err := validateOrderedUTF8(item); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func normalizePatchLineEndings(original, generated []byte) []byte {
+	firstLF := bytes.IndexByte(original, '\n')
+	if firstLF <= 0 || original[firstLF-1] != '\r' || !bytes.Contains(generated, []byte{'\n'}) {
+		return generated
+	}
+	out := make([]byte, 0, len(generated)+bytes.Count(generated, []byte{'\n'}))
+	for i, b := range generated {
+		if b == '\n' && (i == 0 || generated[i-1] != '\r') {
+			out = append(out, '\r')
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+// yamlNodeHasNonJSONMetadata reports whether converting a YAML subtree through
+// JSON would discard information. JSON Patch move currently transfers values
+// through the package's ordered JSON view, so callers must reject such sources
+// instead of silently dropping tags, anchors, aliases, comments, or style.
+func yamlNodeHasNonJSONMetadata(root *yaml.Node) bool {
+	seen := make(map[*yaml.Node]struct{})
+	var walk func(*yaml.Node) bool
+	walk = func(node *yaml.Node) bool {
+		if node == nil {
+			return false
+		}
+		if _, ok := seen[node]; ok {
+			return false
+		}
+		seen[node] = struct{}{}
+
+		styleCarriesMetadata := node.Style != 0
+		if (node.Kind == yaml.MappingNode || node.Kind == yaml.SequenceNode) && node.Style&^yaml.FlowStyle == 0 {
+			// Default-tag flow collections are ordinary JSON values. Their children
+			// are checked independently for styles or metadata that would be lost.
+			styleCarriesMetadata = false
+		}
+		if node.Kind == yaml.AliasNode || node.Anchor != "" || styleCarriesMetadata ||
+			node.HeadComment != "" || node.LineComment != "" || node.FootComment != "" {
+			return true
+		}
+		switch node.Kind {
+		case yaml.ScalarNode:
+			switch node.Tag {
+			case "", "!!str", "!!null", "!!bool", "!!int", "!!float":
+				// These scalar types have direct JSON equivalents.
+			default:
+				return true
+			}
+		case yaml.MappingNode:
+			if node.Tag != "" && node.Tag != "!!map" {
+				return true
+			}
+			for i := 0; i+1 < len(node.Content); i += 2 {
+				key := node.Content[i]
+				if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+					return true
+				}
+			}
+		case yaml.SequenceNode:
+			if node.Tag != "" && node.Tag != "!!seq" {
+				return true
+			}
+		}
+
+		for _, child := range node.Content {
+			if walk(child) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(root)
+}
+
+func yamlNodeHasNonJSONType(root *yaml.Node) bool {
+	visiting := make(map[*yaml.Node]bool)
+	var walk func(*yaml.Node) bool
+	walk = func(node *yaml.Node) bool {
+		if node == nil {
+			return false
+		}
+		if visiting[node] {
+			return true
+		}
+		visiting[node] = true
+		defer delete(visiting, node)
+		if node.Kind == yaml.AliasNode {
+			return walk(node.Alias)
+		}
+		switch node.Kind {
+		case yaml.ScalarNode:
+			switch node.Tag {
+			case "", "!!str", "!!null", "!!bool", "!!int", "!!float":
+			default:
+				return true
+			}
+		case yaml.MappingNode:
+			if node.Tag != "" && node.Tag != "!!map" {
+				return true
+			}
+			for i := 0; i+1 < len(node.Content); i += 2 {
+				if key := node.Content[i]; key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+					return true
+				}
+			}
+		case yaml.SequenceNode:
+			if node.Tag != "" && node.Tag != "!!seq" {
+				return true
+			}
+		}
+		for _, child := range node.Content {
+			if walk(child) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(root)
+}
+
+// removalWouldBreakAlias detects aliases outside the removed subtree that
+// point to the exact yaml.Node being removed. Comparing pointer identity is
+// essential: YAML permits an anchor name to be reused, and syntax-only output
+// validation would otherwise silently retarget the alias to another anchor.
+func removalWouldBreakAlias(scanRoot *yaml.Node, targets ...*yaml.Node) bool {
+	removed := make(map[*yaml.Node]struct{})
+	var collect func(*yaml.Node)
+	collect = func(node *yaml.Node) {
+		if node == nil {
+			return
+		}
+		if _, ok := removed[node]; ok {
+			return
+		}
+		removed[node] = struct{}{}
+		for _, child := range node.Content {
+			collect(child)
+		}
+	}
+	for _, target := range targets {
+		collect(target)
+	}
+
+	seen := make(map[*yaml.Node]struct{})
+	var walk func(*yaml.Node) bool
+	walk = func(node *yaml.Node) bool {
+		if node == nil {
+			return false
+		}
+		if _, ok := seen[node]; ok {
+			return false
+		}
+		seen[node] = struct{}{}
+		_, insideRemoval := removed[node]
+		if node.Kind == yaml.AliasNode && !insideRemoval && node.Alias != nil {
+			if _, targetRemoved := removed[node.Alias]; targetRemoved {
+				return true
+			}
+		}
+		for _, child := range node.Content {
+			if walk(child) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(scanRoot)
+}
+
+// validateYAMLAliasGraph verifies that every alias still points to the exact
+// anchored node that remains reachable through the document's content tree.
+func validateYAMLAliasGraph(root *yaml.Node) error {
+	reachable := make(map[*yaml.Node]struct{})
+	var collect func(*yaml.Node)
+	collect = func(node *yaml.Node) {
+		if node == nil {
+			return
+		}
+		if _, ok := reachable[node]; ok {
+			return
+		}
+		reachable[node] = struct{}{}
+		for _, child := range node.Content {
+			collect(child)
+		}
+	}
+	collect(root)
+
+	for node := range reachable {
+		if node.Kind != yaml.AliasNode {
+			continue
+		}
+		if node.Alias == nil {
+			return fmt.Errorf("yamledit: invalid YAML alias %q has no target", node.Value)
+		}
+		if _, ok := reachable[node.Alias]; !ok {
+			return fmt.Errorf("yamledit: invalid YAML alias %q refers to a removed anchor", node.Value)
+		}
+		if node.Alias.Anchor == "" || (node.Value != "" && node.Alias.Anchor != node.Value) {
+			return fmt.Errorf("yamledit: invalid YAML alias %q no longer matches its anchor", node.Value)
+		}
+	}
+	return nil
+}
+
 func cloneMapIndex(in map[string]*mapInfo) map[string]*mapInfo {
 	out := make(map[string]*mapInfo, len(in))
 	for k, v := range in {
@@ -71,7 +315,22 @@ func keyEquals(k interface{}, want string) bool {
 	}
 }
 
-const pathSep = "\x00p\x00"
+func isStringMappingKey(node *yaml.Node, want string) bool {
+	return node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!str" && node.Value == want
+}
+
+func hasNonStringMappingKeyNamed(mapping *yaml.Node, want string) bool {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		key := mapping.Content[i]
+		if key != nil && key.Kind == yaml.ScalarNode && key.Value == want && key.Tag != "!!str" {
+			return true
+		}
+	}
+	return false
+}
 
 // Sentinel key used to index scalar values that are direct items of a sequence ("- <scalar>")
 const scalarItemKey = "\x00s\x00"
@@ -80,23 +339,97 @@ func joinPath(path []string) string {
 	if len(path) == 0 {
 		return ""
 	}
-	return strings.Join(path, pathSep)
+	var out strings.Builder
+	for _, segment := range path {
+		out.WriteString(strconv.Itoa(len(segment)))
+		out.WriteByte(':')
+		out.WriteString(segment)
+	}
+	return out.String()
 }
 
 func makePathKey(path []string, key string) string {
-	if len(path) == 0 {
-		return key
-	}
-	return strings.Join(append(append([]string{}, path...), key), pathSep)
+	return joinPath(append(append([]string{}, path...), key))
 }
 
-// makeSeqItemPathKey builds the index key for a scalar item at a sequence index.
-// Format: path\x00[idx]
+func clearDeletionMarkersAtOrBelow(st *docState, path []string) {
+	if st == nil || len(st.toDelete) == 0 {
+		return
+	}
+	for encoded := range st.toDelete {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok || len(segments) < len(path) {
+			continue
+		}
+		if pathSegmentsEqual(segments[:len(path)], path) {
+			delete(st.toDelete, encoded)
+		}
+	}
+}
+
+func rebaseDeletionMarkersForSequence(st *docState, sequencePath []string, index, delta int, removeIndex bool) {
+	if st == nil || len(st.toDelete) == 0 {
+		return
+	}
+	updated := make(map[string]struct{}, len(st.toDelete))
+	for encoded := range st.toDelete {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok || len(segments) <= len(sequencePath) ||
+			!pathSegmentsEqual(segments[:len(sequencePath)], sequencePath) {
+			updated[encoded] = struct{}{}
+			continue
+		}
+		itemSegment := segments[len(sequencePath)]
+		if !isIndexPathSegment(itemSegment) {
+			updated[encoded] = struct{}{}
+			continue
+		}
+		itemIndex, err := strconv.Atoi(itemSegment[1 : len(itemSegment)-1])
+		if err != nil {
+			updated[encoded] = struct{}{}
+			continue
+		}
+		if removeIndex && itemIndex == index {
+			continue
+		}
+		if itemIndex > index || (!removeIndex && itemIndex >= index) {
+			segments[len(sequencePath)] = indexSeg(itemIndex + delta)
+			encoded = joinPath(segments)
+		}
+		updated[encoded] = struct{}{}
+	}
+	st.toDelete = updated
+}
+
+// makeSeqItemPathKey builds the length-prefixed internal key for a scalar item
+// at a sequence index.
 func makeSeqItemPathKey(path []string, idx int) string {
 	segs := make([]string, 0, len(path)+1)
 	segs = append(segs, path...)
 	segs = append(segs, fmt.Sprintf("[%d]", idx))
-	return strings.Join(segs, pathSep)
+	return joinPath(segs)
+}
+
+func splitJoinedPath(encoded string) ([]string, bool) {
+	if encoded == "" {
+		return nil, true
+	}
+	var out []string
+	for pos := 0; pos < len(encoded); {
+		colon := strings.IndexByte(encoded[pos:], ':')
+		if colon < 0 {
+			return nil, false
+		}
+		colon += pos
+		length, err := strconv.Atoi(encoded[pos:colon])
+		if err != nil || length < 0 || colon+1+length > len(encoded) {
+			return nil, false
+		}
+		start := colon + 1
+		out = append(out, encoded[start:start+length])
+		pos = start + length
+	}
+	return out, true
 }
 
 func buildLineOffsets(b []byte) []int {
@@ -111,12 +444,101 @@ func buildLineOffsets(b []byte) []int {
 	return offsets
 }
 
-func offsetFor(lineOffsets []int, line, col int) int {
-	// yaml.v3 uses 1-based line/column
+func offsetFor(b []byte, lineOffsets []int, line, col int) int {
+	// yaml.v3 uses 1-based line/column, and columns count Unicode code points
+	// rather than bytes. Walk the line so non-ASCII keys do not shift a value's
+	// byte offset into the middle of a UTF-8 sequence.
 	if line <= 0 || col <= 0 || line > len(lineOffsets) {
 		return -1
 	}
-	return lineOffsets[line-1] + (col - 1)
+	pos := lineOffsets[line-1]
+	if line == 1 && pos == 0 && len(b) >= 3 && b[0] == 0xef && b[1] == 0xbb && b[2] == 0xbf {
+		// yaml.v3 does not count a UTF-8 BOM as a source column.
+		pos = 3
+	}
+	for currentCol := 1; currentCol < col; currentCol++ {
+		if pos >= len(b) || b[pos] == '\n' {
+			return -1
+		}
+		_, size := utf8.DecodeRune(b[pos:])
+		if size == 0 {
+			return -1
+		}
+		pos += size
+	}
+	return pos
+}
+
+// scalarValueOffset advances past YAML node properties such as anchors and
+// explicit tags. yaml.v3 reports a scalar's Column at the first property, but
+// surgery must replace only the value token or aliases will be left dangling.
+func scalarValueOffset(b []byte, lineOffsets []int, node *yaml.Node) int {
+	pos, _ := scalarValueProperties(b, lineOffsets, node)
+	return pos
+}
+
+func scalarHasExplicitTag(b []byte, lineOffsets []int, node *yaml.Node) bool {
+	_, hasTag := scalarValueProperties(b, lineOffsets, node)
+	return hasTag
+}
+
+func scalarValueProperties(b []byte, lineOffsets []int, node *yaml.Node) (int, bool) {
+	pos := offsetFor(b, lineOffsets, node.Line, node.Column)
+	if pos < 0 || pos >= len(b) || node.Kind != yaml.ScalarNode {
+		return pos, false
+	}
+	hasTag := false
+	for {
+		for pos < len(b) && (b[pos] == ' ' || b[pos] == '\t') {
+			pos++
+		}
+		if pos >= len(b) || b[pos] == '\r' || b[pos] == '\n' || b[pos] == '#' {
+			return -1, hasTag
+		}
+		if b[pos] != '&' && b[pos] != '!' {
+			return pos, hasTag
+		}
+		if b[pos] == '!' {
+			hasTag = true
+			if pos+1 < len(b) && b[pos+1] == '<' {
+				end := bytes.IndexByte(b[pos+2:], '>')
+				if end < 0 {
+					return -1, hasTag
+				}
+				pos += end + 3
+				continue
+			}
+		}
+		for pos < len(b) {
+			c := b[pos]
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '[' || c == ']' || c == '{' || c == '}' || c == ',' {
+				break
+			}
+			pos++
+		}
+	}
+}
+
+func scalarYAMLTag(v interface{}) (string, bool) {
+	switch value := v.(type) {
+	case nil:
+		return "!!null", true
+	case bool:
+		return "!!bool", true
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return "!!int", true
+	case float32, float64:
+		return "!!float", true
+	case json.Number:
+		if strings.ContainsAny(string(value), ".eE") {
+			return "!!float", true
+		}
+		return "!!int", true
+	case string:
+		return "!!str", true
+	default:
+		return "", false
+	}
 }
 
 func lineStartOffset(lineOffsets []int, line int) int {
@@ -206,17 +628,93 @@ func findScalarEndOnLine(b []byte, pos int) int {
 	// Bare token: read until comment or newline (scanLimit)
 	j := pos
 	for j < scanLimit {
-		if b[j] == '#' {
+		// In a plain YAML scalar, '#' starts a comment only at the beginning
+		// or after whitespace. A fragment such as "url#anchor" is data.
+		if b[j] == '#' && (j == pos || b[j-1] == ' ' || b[j-1] == '\t') {
 			break
 		}
 		j++
 	}
 	// Trim trailing spaces before comment/hash
 	k := j
-	for k > pos && (b[k-1] == ' ' || b[k-1] == '\t') {
+	for k > pos && (b[k-1] == ' ' || b[k-1] == '\t' || b[k-1] == '\r') {
 		k--
 	}
 	return k
+}
+
+// scalarSpansPhysicalLines reports scalars whose token or plain continuation
+// extends beyond its first source line. Replacing only the first-line byte
+// range would leave a closing quote or continuation text behind, so callers
+// must promote these edits to a whole-entry structural rewrite.
+func scalarSpansPhysicalLines(b []byte, node *yaml.Node, valStart, containerIndent int) bool {
+	if node == nil || node.Kind != yaml.ScalarNode || valStart < 0 || valStart >= len(b) {
+		return false
+	}
+	if node.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0 {
+		return true
+	}
+	if strings.Contains(node.Value, "\n") {
+		return true
+	}
+
+	quote := b[valStart]
+	if quote == '\'' || quote == '"' {
+		spans := false
+		escaped := false
+		for i := valStart + 1; i < len(b); i++ {
+			c := b[i]
+			if c == '\n' {
+				spans = true
+			}
+			if quote == '"' {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if c == '\\' {
+					escaped = true
+					continue
+				}
+				if c == '"' {
+					return spans
+				}
+				continue
+			}
+			if c == '\'' {
+				if i+1 < len(b) && b[i+1] == '\'' {
+					i++
+					continue
+				}
+				return spans
+			}
+		}
+		// The parser accepted the node, so this is normally unreachable. Be
+		// conservative if source/token accounting ever disagrees.
+		return spans
+	}
+
+	firstEnd := findLineEnd(b, valStart)
+	if firstEnd < 0 || firstEnd >= len(b)-1 || b[firstEnd] != '\n' {
+		return false
+	}
+	for lineStart := firstEnd + 1; lineStart < len(b); {
+		lineEnd := findLineEnd(b, lineStart)
+		exclusive := lineEnd
+		if lineEnd < len(b) && b[lineEnd] != '\n' {
+			exclusive++
+		}
+		line := b[lineStart:exclusive]
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) != 0 && trimmed[0] != '#' {
+			return countLeadingIndent(line) > containerIndent
+		}
+		if lineEnd >= len(b)-1 || b[lineEnd] != '\n' {
+			break
+		}
+		lineStart = lineEnd + 1
+	}
+	return false
 }
 
 // --------------------------------------------------------------------------------------
@@ -287,6 +785,7 @@ func detectIndent(b []byte) int {
 
 	// Collect all non-zero indents from non-blank, non-comment lines
 	indents := []int{}
+	blockKeyIndent := -1
 	for _, ln := range lines {
 		if len(bytes.TrimSpace(ln)) == 0 {
 			continue
@@ -298,8 +797,17 @@ func detectIndent(b []byte) int {
 		}
 
 		n := leadingSpaces(ln)
+		if blockKeyIndent >= 0 {
+			if n > blockKeyIndent {
+				continue
+			}
+			blockKeyIndent = -1
+		}
 		if n > 0 {
 			indents = append(indents, n)
+		}
+		if lineStartsBlockScalar(ln) {
+			blockKeyIndent = n
 		}
 	}
 
@@ -322,6 +830,27 @@ func detectIndent(b []byte) int {
 	return 2
 }
 
+func lineStartsBlockScalar(line []byte) bool {
+	if comment := yamlCommentStart(line); comment >= 0 {
+		line = line[:comment]
+	}
+	trimmed := bytes.TrimSpace(line)
+	fields := bytes.Fields(trimmed)
+	if len(fields) == 0 {
+		return false
+	}
+	header := fields[len(fields)-1]
+	if len(header) == 0 || (header[0] != '|' && header[0] != '>') {
+		return false
+	}
+	for _, c := range header[1:] {
+		if c != '+' && c != '-' && (c < '1' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
 func gcd(a, b int) int {
 	if a < 0 {
 		a = -a
@@ -342,7 +871,7 @@ func makeSeqPathKey(path []string, idx int, key string) string {
 	segs = append(segs, path...)
 	segs = append(segs, fmt.Sprintf("[%d]", idx))
 	segs = append(segs, key)
-	return strings.Join(segs, pathSep)
+	return joinPath(segs)
 }
 
 func leadingSpaces(line []byte) int {
@@ -438,10 +967,49 @@ var yamlBareDisallowed = map[string]struct{}{
 // with renderScalar (i.e. not a nested list/map).
 func isScalarValue(v interface{}) bool {
 	switch v.(type) {
-	case int, int64, float64, bool, string, nil:
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number, bool, string, nil:
 		return true
 	default:
 		return false
+	}
+}
+
+func renderScalarToken(v interface{}) (string, bool) {
+	switch value := v.(type) {
+	case nil:
+		return "null", true
+	case bool:
+		return strconv.FormatBool(value), true
+	case int:
+		return strconv.Itoa(value), true
+	case int8:
+		return strconv.FormatInt(int64(value), 10), true
+	case int16:
+		return strconv.FormatInt(int64(value), 10), true
+	case int32:
+		return strconv.FormatInt(int64(value), 10), true
+	case int64:
+		return strconv.FormatInt(value, 10), true
+	case uint:
+		return strconv.FormatUint(uint64(value), 10), true
+	case uint8:
+		return strconv.FormatUint(uint64(value), 10), true
+	case uint16:
+		return strconv.FormatUint(uint64(value), 10), true
+	case uint32:
+		return strconv.FormatUint(uint64(value), 10), true
+	case uint64:
+		return strconv.FormatUint(value, 10), true
+	case float32:
+		return formatYAMLFloat(float64(value)), true
+	case float64:
+		return formatYAMLFloat(value), true
+	case json.Number:
+		return string(value), true
+	case string:
+		return renderStringToken(value), true
+	default:
+		return "", false
 	}
 }
 
@@ -459,12 +1027,71 @@ func isSafeBareString(s string) bool {
 			return false
 		}
 	}
-	return true
+
+	// Syntax alone is not enough: values such as 123, true, .nan, and dates
+	// are valid plain YAML but resolve to non-string tags. Ask yaml.v3 how the
+	// candidate resolves and only emit it bare when it remains the exact string.
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte("value: "+s+"\n"), &doc); err != nil || len(doc.Content) == 0 {
+		return false
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode || len(root.Content) < 2 {
+		return false
+	}
+	v := root.Content[1]
+	return v.Kind == yaml.ScalarNode && v.Tag == "!!str" && v.Value == s
+}
+
+func hasYAMLControlCharacters(s string) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for _, r := range s {
+		// YAML's printable set excludes C0/C1 controls and Unicode
+		// noncharacters. U+FEFF is technically printable away from the start of
+		// a stream, but escaping it avoids it being mistaken for an embedded BOM
+		// by less careful readers. The Unicode line/paragraph separators must also
+		// be escaped because YAML treats them as physical line breaks.
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) || r == 0x2028 || r == 0x2029 || r == 0xfeff ||
+			(r >= 0xfdd0 && r <= 0xfdef) || r&0xffff == 0xfffe || r&0xffff == 0xffff {
+			return true
+		}
+	}
+	return false
+}
+
+func renderStringToken(s string) string {
+	if isSafeBareString(s) {
+		return s
+	}
+	return quoteNewStringToken(s)
+}
+
+func renderMappingKey(key string) string {
+	return renderStringToken(key)
+}
+
+func formatYAMLFloat(v float64) string {
+	switch {
+	case math.IsNaN(v):
+		return ".nan"
+	case math.IsInf(v, 1):
+		return ".inf"
+	case math.IsInf(v, -1):
+		return "-.inf"
+	}
+
+	s := strconv.FormatFloat(v, 'g', -1, 64)
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
+	}
+	return s
 }
 
 // Use existing quote style when replacing; if old token was bare but new is unsafe, add quotes.
 func stringReplacementToken(oldTok []byte, newVal string) []byte {
-	if len(oldTok) > 0 && oldTok[0] == '\'' {
+	if len(oldTok) > 0 && oldTok[0] == '\'' && !hasYAMLControlCharacters(newVal) {
 		// single-quoted → escape by doubling single quotes
 		return []byte("'" + strings.ReplaceAll(newVal, "'", "''") + "'")
 	}
@@ -485,22 +1112,31 @@ func stringReplacementToken(oldTok []byte, newVal string) []byte {
 
 // For new insertions, prefer single quotes (no escapes) if possible; otherwise double-quote.
 func quoteNewStringToken(s string) string {
-	if !strings.Contains(s, "'") && !strings.ContainsAny(s, "\n\r\t") {
+	if !strings.Contains(s, "'") && !hasYAMLControlCharacters(s) {
 		return "'" + s + "'"
 	}
-	return `"` + escapeDoubleQuotes(s) + `"`
+	return quoteYAMLDoubleString(s)
 }
 
 func escapeDoubleQuotes(s string) string {
-	// Keep it simple: escape backslash and double quote; also encode newlines/tabs
-	repl := strings.NewReplacer(
-		`\\`, `\\`,
-		`"`, `\"`,
-		"\n", `\n`,
-		"\r", `\r`,
-		"\t", `\t`,
-	)
-	return repl.Replace(s)
+	quoted := quoteYAMLDoubleString(s)
+	return quoted[1 : len(quoted)-1]
+}
+
+func quoteYAMLDoubleString(s string) string {
+	quoted := strconv.Quote(s)
+	if hasYAMLControlCharacters(s) {
+		// QuoteToASCII guarantees that forbidden/noncharacter runes and invalid
+		// UTF-8 bytes never leak into the YAML byte stream. YAML accepts the Go
+		// \x/\u/\U escape forms used here in double-quoted scalars.
+		quoted = strconv.QuoteToASCII(s)
+	}
+	// YAML treats these Unicode code points as line breaks even inside
+	// single-quoted scalars. Escape them explicitly so the exact string survives.
+	quoted = strings.ReplaceAll(quoted, "\u0085", `\u0085`)
+	quoted = strings.ReplaceAll(quoted, "\u2028", `\u2028`)
+	quoted = strings.ReplaceAll(quoted, "\u2029", `\u2029`)
+	return quoted
 }
 
 // --------------------------------------------------------------------------------------
@@ -517,9 +1153,15 @@ func maxLineEndForNode(st *docState, n *yaml.Node) int {
 			return
 		}
 		if n.Line > 0 && n.Column > 0 {
-			vs := offsetFor(st.lineOffsets, n.Line, n.Column)
+			vs := scalarValueOffset(st.original, st.lineOffsets, n)
 			if vs >= 0 && vs < len(st.original) {
 				le := findLineEnd(st.original, vs)
+				if n.Kind == yaml.ScalarNode && (st.original[vs] == '|' || st.original[vs] == '>') {
+					lineStart := lineStartOffset(st.lineOffsets, n.Line)
+					lineEnd := findLineEnd(st.original, lineStart)
+					keyIndent := leadingSpaces(st.original[lineStart:min(lineEnd+1, len(st.original))])
+					le = extendScalarBlockEnd(st.original, st.lineOffsets, n.Line, keyIndent)
+				}
 				if le > maxEnd {
 					maxEnd = le
 				}

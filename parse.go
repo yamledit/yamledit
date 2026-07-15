@@ -1,94 +1,108 @@
 package yamledit
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"weak"
 
 	gyaml "github.com/goccy/go-yaml"
 	"gopkg.in/yaml.v3"
 )
 
-// normalizeEmptyEnvMap converts "envs:" (parsed as !!null) into an empty mapping
-// in the yaml.v3 AST and in the ordered logical view, and marks the doc as
-// structurally dirty so Marshal() will fall back to a full re-encode.
-// normalizeImplicitMaps converts keys with implicit null values (e.g. "key:")
-// into empty mappings. This keeps YAML semantics (null vs explicit empty map)
-// while avoiding hard‑coded key names (previously "envs").
+// decodeSingleYAMLDocument decodes exactly one YAML document. yaml.Unmarshal
+// accepts a stream and stops after its first document, which can hide a valid
+// second document or malformed trailing content from callers that expect this
+// package to edit one mapping document.
+func decodeSingleYAMLDocument(data []byte, doc *yaml.Node) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(doc); err != nil {
+		return err
+	}
+
+	var trailing yaml.Node
+	switch err := dec.Decode(&trailing); {
+	case err == io.EOF:
+		return nil
+	case err != nil:
+		return fmt.Errorf("invalid trailing YAML content: %w", err)
+	default:
+		return fmt.Errorf("multiple YAML documents are not supported")
+	}
+}
+
+func isYAMLTriviaOnly(data []byte) bool {
+	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		line = bytes.TrimSpace(line)
+		if len(line) != 0 && line[0] != '#' {
+			return false
+		}
+	}
+	return true
+}
+
+// normalizeImplicitMaps preserves the package's established convenience that
+// a bare mapping value (`key:`) behaves as an empty mapping. Restrict the
+// coercion to implicit nulls inside ordinary maps: explicit !!null values and
+// null-shaped entries used by semantic mapping types such as !!set must retain
+// their YAML meaning.
 func normalizeImplicitMaps(doc *yaml.Node, st *docState) {
 	if doc == nil || st == nil || doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
 		return
 	}
-	root := doc.Content[0]
-	if root == nil || root.Kind != yaml.MappingNode {
-		return
-	}
-
-	var walk func(n *yaml.Node, path []ptrToken)
-	walk = func(n *yaml.Node, path []ptrToken) {
-		if n == nil {
+	var walk func(*yaml.Node, []ptrToken)
+	walk = func(node *yaml.Node, path []ptrToken) {
+		if node == nil {
 			return
 		}
-
-		switch n.Kind {
+		switch node.Kind {
 		case yaml.MappingNode:
-			for i := 0; i+1 < len(n.Content); i += 2 {
-				k := n.Content[i]
-				v := n.Content[i+1]
-				if k.Kind != yaml.ScalarNode {
+			if node.Tag != "" && node.Tag != "!!map" {
+				return
+			}
+			for i := 0; i+1 < len(node.Content); i += 2 {
+				key, value := node.Content[i], node.Content[i+1]
+				if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
 					continue
 				}
-				key := k.Value
-
-				// Generic check: implicit scalar null (e.g. "key:" with no value).
-				// yaml.v3 represents this as tag "!!null" with an empty Value.
-				if v.Kind == yaml.ScalarNode && v.Tag == "!!null" && v.Value == "" {
-					// Replace scalar null with an empty !!map in the AST, preserving
-					// comments and position metadata so later indexing still works.
-					m := &yaml.Node{
+				if value.Kind == yaml.ScalarNode && value.Tag == "!!null" && value.Value == "" &&
+					value.Anchor == "" && !scalarHasExplicitTag(st.original, st.lineOffsets, value) {
+					replacement := &yaml.Node{
 						Kind:        yaml.MappingNode,
 						Tag:         "!!map",
-						HeadComment: v.HeadComment,
-						LineComment: v.LineComment,
-						FootComment: v.FootComment,
-						Anchor:      v.Anchor,
-						Line:        v.Line,
-						Column:      v.Column,
+						HeadComment: value.HeadComment,
+						LineComment: value.LineComment,
+						FootComment: value.FootComment,
+						Line:        value.Line,
+						Column:      value.Column,
 					}
-					n.Content[i+1] = m
-
-					// Build a ptrToken path from the document root to this key.
-					fullPath := append(append([]ptrToken(nil), path...), ptrToken{key: key})
-
-					// Update the logical ordered view so that Marshal() sees an empty
-					// mapping at the same logical location.
-					if newOrdered, err := setOrderedAtPath(st.ordered, fullPath, gyaml.MapSlice{}); err == nil {
-						st.ordered = newOrdered
+					node.Content[i+1] = replacement
+					fullPath := append(append([]ptrToken(nil), path...), ptrToken{key: key.Value})
+					if updated, err := setOrderedAtPath(st.ordered, fullPath, gyaml.MapSlice{}); err == nil {
+						st.ordered = updated
 					}
-
-					// Mark that we changed structure so Marshal() won't try pure
-					// byte‑surgery for this document.
 					st.structuralDirty = true
-					// No need to recurse into the freshly created empty map.
 					continue
 				}
-
-				nextPath := append(path, ptrToken{key: key})
-				if v.Kind == yaml.MappingNode || v.Kind == yaml.SequenceNode {
-					walk(v, nextPath)
-				}
+				walk(value, append(path, ptrToken{key: key.Value}))
 			}
-
 		case yaml.SequenceNode:
-			for idx, c := range n.Content {
-				walk(c, append(path, ptrToken{isIdx: true, index: idx}))
+			for index, child := range node.Content {
+				walk(child, append(path, ptrToken{isIdx: true, index: index}))
 			}
 		}
 	}
-
-	walk(root, nil)
+	walk(doc.Content[0], nil)
 }
 
 // Parse reads YAML data and returns a yaml.Node, creating a minimal mapping document if empty.
 func Parse(data []byte) (*yaml.Node, error) {
+	for i, b := range data {
+		if b == '\r' && (i+1 >= len(data) || data[i+1] != '\n') {
+			return nil, fmt.Errorf("yamledit: failed to parse YAML: lone carriage-return line endings are unsupported")
+		}
+	}
 	doc := &yaml.Node{
 		Kind:    yaml.DocumentNode,
 		Content: []*yaml.Node{{Kind: yaml.MappingNode, Tag: "!!map"}},
@@ -96,35 +110,71 @@ func Parse(data []byte) (*yaml.Node, error) {
 
 	if len(data) > 0 {
 		var tmp yaml.Node
-		if err := yaml.Unmarshal(data, &tmp); err != nil {
-			return nil, fmt.Errorf("yamledit: failed to parse YAML: %w", err)
+		if err := decodeSingleYAMLDocument(data, &tmp); err != nil {
+			if err != io.EOF || !isYAMLTriviaOnly(data) {
+				return nil, fmt.Errorf("yamledit: failed to parse YAML: %w", err)
+			}
+		} else {
+			if tmp.Kind != yaml.DocumentNode || len(tmp.Content) == 0 || tmp.Content[0].Kind != yaml.MappingNode {
+				return nil, fmt.Errorf("yamledit: top-level YAML is not a mapping")
+			}
+			doc = &tmp
 		}
-		if tmp.Kind != yaml.DocumentNode || len(tmp.Content) == 0 || tmp.Content[0].Kind != yaml.MappingNode {
-			return nil, fmt.Errorf("yamledit: top-level YAML is not a mapping")
-		}
-		doc = &tmp
 	}
 
 	// Build shadow state using goccy/go-yaml (to preserve comments and ordered map for fallback)
 	st := &docState{
-		doc:               doc,
-		comments:          gyaml.CommentMap{},
-		ordered:           gyaml.MapSlice{},
-		subPathByHN:       map[*yaml.Node][]string{},
-		indent:            2,
-		indentSeq:         true,
-		original:          append([]byte(nil), data...),
-		lineOffsets:       buildLineOffsets(data),
-		mapIndex:          map[string]*mapInfo{},
-		valueOccByPathKey: map[string][]valueOcc{},
-		boundsByPathKey:   map[string][]kvBounds{}, // Initialize new map
-		seqIndex:          map[string]*seqInfo{},
-		toDelete:          map[string]struct{}{},
+		doc:                weak.Make(doc),
+		comments:           gyaml.CommentMap{},
+		ordered:            gyaml.MapSlice{},
+		subPathByHN:        map[weak.Pointer[yaml.Node]][]string{},
+		indent:             2,
+		indentSeq:          true,
+		original:           append([]byte(nil), data...),
+		originalRootEmpty:  len(data) > 0 && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0,
+		originalTriviaOnly: len(data) > 0 && isYAMLTriviaOnly(data),
+		lineOffsets:        buildLineOffsets(data),
+		mapIndex:           map[string]*mapInfo{},
+		valueOccByPathKey:  map[string][]valueOcc{},
+		boundsByPathKey:    map[string][]kvBounds{}, // Initialize new map
+		unsafePathKeys:     map[string]struct{}{},
+		opaquePathKeys:     map[string]struct{}{},
+		seqIndex:           map[string]*seqInfo{},
+		toDelete:           map[string]struct{}{},
+	}
+	if st.originalRootEmpty {
+		root := doc.Content[0]
+		start := offsetFor(data, st.lineOffsets, root.Line, root.Column)
+		if start >= 0 && start < len(data) {
+			if open := bytes.IndexByte(data[start:], '{'); open >= 0 {
+				open += start
+				if close := bytes.IndexByte(data[open+1:], '}'); close >= 0 {
+					close += open + 1
+					if !bytes.Contains(data[open+1:close], []byte{'#'}) {
+						st.rootTokenStart, st.rootTokenEnd = open, close+1
+					}
+				}
+			}
+		}
 	}
 
 	// Decode into ordered map and capture comments; detect indent and sequence style
 	if len(data) > 0 {
-		if err := gyaml.UnmarshalWithOptions(data, &st.ordered, gyaml.UseOrderedMap(), gyaml.CommentToMap(st.comments)); err == nil {
+		shadowData := bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
+		if err := gyaml.UnmarshalWithOptions(shadowData, &st.ordered, gyaml.UseOrderedMap(), gyaml.CommentToMap(st.comments)); err == nil {
+			ind, seq := detectIndentAndSequence(data)
+			st.indent, st.indentSeq = ind, seq
+		} else {
+			// goccy rejects some YAML accepted by yaml.v3 (notably duplicate
+			// keys). An empty shadow makes later edits invent empty mappings and
+			// lose unrelated data, so build an ordered logical view from the AST.
+			shadow, shadowErr := yamlNodeToOrderedValue(doc.Content[0])
+			if shadowErr != nil {
+				return nil, fmt.Errorf("yamledit: failed to build ordered YAML view: %w", shadowErr)
+			}
+			if ordered, ok := shadow.(gyaml.MapSlice); ok {
+				st.ordered = ordered
+			}
 			ind, seq := detectIndentAndSequence(data)
 			st.indent, st.indentSeq = ind, seq
 		}
@@ -133,16 +183,11 @@ func Parse(data []byte) (*yaml.Node, error) {
 	// Keep a snapshot of the original ordered map for diffing
 	st.origOrdered = cloneMapSlice(st.ordered)
 
-	// Normalize pathological shapes (e.g. "envs:" parsed as !!null) into an
-	// empty mapping in the AST and logical view. This is marked as a structural
-	// change so Marshal() will fall back to full encode, producing "envs: {}".
-	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode {
-		normalizeImplicitMaps(doc, st)
-	}
+	normalizeImplicitMaps(doc, st)
 
 	// Index mapping handles (for path lookups later on)
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode {
-		st.subPathByHN[doc.Content[0]] = nil
+		st.subPathByHN[weak.Make(doc.Content[0])] = nil
 		indexMappingHandles(st, doc.Content[0], nil)
 
 		// Build byte-surgical indices off the original parsed tree
@@ -155,16 +200,85 @@ func Parse(data []byte) (*yaml.Node, error) {
 	// including mapping entries inside sequences. This is what allows structuralRewrite
 	// to patch ONLY the changed key (e.g. groupId) without re-encoding sibling block scalars.
 	if len(data) > 0 {
-		st.boundsByPathKey = indexBoundsByPathKeyDeep(st.original, doc)
+		st.boundsByPathKey, st.unsafePathKeys, st.opaquePathKeys = indexBoundsByPathKeyDeep(st.original, doc)
 	}
 
 	register(doc, st)
 	return doc, nil
 }
 
+const orderedShadowNodeBudget = 100_000
+
+func yamlNodeToOrderedValue(node *yaml.Node) (interface{}, error) {
+	budget := orderedShadowNodeBudget
+	return yamlNodeToOrderedValueSeen(node, make(map[*yaml.Node]bool), &budget)
+}
+
+func yamlNodeToOrderedValueSeen(node *yaml.Node, visiting map[*yaml.Node]bool, budget *int) (interface{}, error) {
+	if node == nil {
+		return nil, nil
+	}
+	if budget == nil || *budget <= 0 {
+		return nil, fmt.Errorf("ordered shadow exceeds alias expansion limit of %d nodes", orderedShadowNodeBudget)
+	}
+	*budget = *budget - 1
+	if visiting[node] {
+		// Recursive aliases are valid YAML graphs but cannot be represented by
+		// the acyclic ordered shadow. Keep a nil placeholder instead of recursing
+		// until stack exhaustion; unsupported edits will safely fall back/error.
+		return nil, nil
+	}
+	visiting[node] = true
+	defer delete(visiting, node)
+	switch node.Kind {
+	case yaml.DocumentNode:
+		if len(node.Content) == 0 {
+			return gyaml.MapSlice{}, nil
+		}
+		return yamlNodeToOrderedValueSeen(node.Content[0], visiting, budget)
+	case yaml.MappingNode:
+		out := make(gyaml.MapSlice, 0, len(node.Content)/2)
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if key.Kind != yaml.ScalarNode {
+				continue
+			}
+			value, err := yamlNodeToOrderedValueSeen(node.Content[i+1], visiting, budget)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, gyaml.MapItem{Key: key.Value, Value: value})
+		}
+		return out, nil
+	case yaml.SequenceNode:
+		out := make([]interface{}, 0, len(node.Content))
+		for _, child := range node.Content {
+			value, err := yamlNodeToOrderedValueSeen(child, visiting, budget)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, value)
+		}
+		return out, nil
+	case yaml.AliasNode:
+		return yamlNodeToOrderedValueSeen(node.Alias, visiting, budget)
+	case yaml.ScalarNode:
+		value := yamlNodeToInterface(node)
+		if _, unresolved := value.(string); unresolved && (node.Tag == "!!int" || node.Tag == "!!float") {
+			var decoded interface{}
+			if err := node.Decode(&decoded); err == nil {
+				return decoded, nil
+			}
+		}
+		return value, nil
+	default:
+		return nil, nil
+	}
+}
+
 // indexSeqPositions indexes scalar positions for sequence items which are mapping nodes.
 func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
-	if seq == nil || seq.Kind != yaml.SequenceNode {
+	if seq == nil || seq.Kind != yaml.SequenceNode || seq.Style&yaml.FlowStyle != 0 {
 		return
 	}
 	for idx, it := range seq.Content {
@@ -192,7 +306,7 @@ func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 					continue
 				}
 
-				valStart := offsetFor(st.lineOffsets, v.Line, v.Column)
+				valStart := scalarValueOffset(st.original, st.lineOffsets, v)
 				if valStart < 0 || valStart >= len(st.original) {
 					continue
 				}
@@ -204,6 +318,10 @@ func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 					valStart:     valStart,
 					valEnd:       valEnd,
 					lineEnd:      lineEnd,
+					tag:          v.Tag,
+					explicitTag:  scalarHasExplicitTag(st.original, st.lineOffsets, v),
+					blockStyle:   v.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0,
+					multiline:    scalarSpansPhysicalLines(st.original, v, valStart, k.Column-1),
 				})
 			}
 		}
@@ -212,7 +330,7 @@ func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 
 // indexScalarSeqPositions indexes positions for sequence items which are scalar nodes.
 func indexScalarSeqPositions(st *docState, seq *yaml.Node, cur []string) {
-	if seq == nil || seq.Kind != yaml.SequenceNode {
+	if seq == nil || seq.Kind != yaml.SequenceNode || seq.Style&yaml.FlowStyle != 0 {
 		return
 	}
 
@@ -238,26 +356,33 @@ func indexScalarSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 		}
 
 		// We have a scalar item. Index its value position.
-		valStart := offsetFor(st.lineOffsets, it.Line, it.Column)
+		valStart := scalarValueOffset(st.original, st.lineOffsets, it)
 		if valStart < 0 || valStart >= len(st.original) {
 			continue
 		}
 		valEnd := findScalarEndOnLine(st.original, valStart)
 		lineEnd := findLineEnd(st.original, valStart)
 
-		// We use the index path key format: path\x00[idx].
+		// Include the sequence index in the length-prefixed internal path key.
 		pk := makeSeqItemPathKey(cur, idx)
 		st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
 			keyLineStart: lineStartOffset(st.lineOffsets, it.Line),
 			valStart:     valStart,
 			valEnd:       valEnd,
 			lineEnd:      lineEnd,
+			tag:          it.Tag,
+			explicitTag:  scalarHasExplicitTag(st.original, st.lineOffsets, it),
+			blockStyle:   it.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0,
+			multiline:    scalarSpansPhysicalLines(st.original, it, valStart, leadingSpaces(st.original[lineStartOffset(st.lineOffsets, it.Line):min(findLineEnd(st.original, valStart)+1, len(st.original))])),
 		})
 	}
 }
 
 // indexSequenceAnchors captures indent/style and insertion anchors for sequences (both scalars and mappings).
 func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
+	if seq == nil || seq.Style&yaml.FlowStyle != 0 {
+		return
+	}
 	mpath := joinPath(cur)
 	si := st.seqIndex[mpath]
 	if si == nil {
@@ -286,6 +411,32 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 		if it.Kind == yaml.MappingNode && len(it.Content) >= 2 {
 			fk := it.Content[0]
 			start = lineStartOffset(st.lineOffsets, fk.Line)
+			// yaml.v3 locates a block mapping at its first key, not at a
+			// preceding standalone sequence dash/property line:
+			//
+			//   - &anchor
+			//     key: value
+			//
+			// A whole-item/sequence replacement must include that line or it
+			// leaves an orphan dash behind. Pull the start back one physical line
+			// when the previous line can only be the introducer for this node.
+			if start > 0 {
+				prevEnd := start - 1
+				if prevEnd > 0 && st.original[prevEnd] == '\n' {
+					prevEnd--
+				}
+				prevStart := prevEnd
+				for prevStart > 0 && st.original[prevStart-1] != '\n' {
+					prevStart--
+				}
+				prevLine := bytes.TrimSpace(st.original[prevStart : prevEnd+1])
+				if len(prevLine) > 0 && prevLine[0] == '-' {
+					rest := bytes.TrimSpace(prevLine[1:])
+					if len(rest) == 0 || rest[0] == '#' || rest[0] == '&' || rest[0] == '!' {
+						start = prevStart
+					}
+				}
+			}
 		} else {
 			start = lineStartOffset(st.lineOffsets, it.Line)
 		}
@@ -309,7 +460,10 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 				end = maxEnd
 			}
 		} else {
-			end = findLineEnd(st.original, start)
+			end = maxLineEndForNode(st, it)
+			if end == 0 {
+				end = findLineEnd(st.original, start)
+			}
 		}
 
 		// name (best-effort identity: "name" field value or scalar value)
@@ -317,7 +471,7 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 			for j := 0; j+1 < len(it.Content); j += 2 {
 				k := it.Content[j]
 				v := it.Content[j+1]
-				if k.Kind == yaml.ScalarNode && k.Value == "name" && v.Kind == yaml.ScalarNode {
+				if isStringMappingKey(k, "name") && v.Kind == yaml.ScalarNode {
 					name = v.Value
 					break
 				}
@@ -432,11 +586,11 @@ func indexMappingHandles(st *docState, n *yaml.Node, cur []string) {
 	if n == nil || n.Kind != yaml.MappingNode {
 		return
 	}
-	st.subPathByHN[n] = append([]string(nil), cur...)
+	st.subPathByHN[weak.Make(n)] = append([]string(nil), cur...)
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		k := n.Content[i]
 		v := n.Content[i+1]
-		if k.Kind == yaml.ScalarNode {
+		if k.Kind == yaml.ScalarNode && k.Tag == "!!str" {
 			seg := k.Value
 			if v.Kind == yaml.MappingNode {
 				indexMappingHandles(st, v, append(cur, seg))
@@ -447,7 +601,7 @@ func indexMappingHandles(st *docState, n *yaml.Node, cur []string) {
 
 // indexPositions populates indices for surgical edits: mapIndex, valueOccByPathKey, seqIndex, and boundsByPathKey.
 func indexPositions(st *docState, n *yaml.Node, cur []string) {
-	if n == nil || n.Kind != yaml.MappingNode {
+	if n == nil || n.Kind != yaml.MappingNode || n.Style&yaml.FlowStyle != 0 {
 		return
 	}
 	mapPath := joinPath(cur)
@@ -474,7 +628,7 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 		}
 
 		keyLineStart := lineStartOffset(st.lineOffsets, k.Line)
-		valStart := offsetFor(st.lineOffsets, v.Line, v.Column)
+		valStart := scalarValueOffset(st.original, st.lineOffsets, v)
 
 		var lineEnd int
 		if valStart >= 0 && valStart < len(st.original) {
@@ -523,6 +677,10 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 				valStart:     valStart,
 				valEnd:       valEnd,
 				lineEnd:      scalarLineEnd,
+				tag:          v.Tag,
+				explicitTag:  scalarHasExplicitTag(st.original, st.lineOffsets, v),
+				blockStyle:   v.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0,
+				multiline:    scalarSpansPhysicalLines(st.original, v, valStart, k.Column-1),
 			})
 		}
 

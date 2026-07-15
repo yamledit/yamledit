@@ -2,6 +2,7 @@ package yamledit
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -26,8 +27,24 @@ func orderedToYAMLNode(v interface{}) *yaml.Node {
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(t)}
 	case int64:
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatInt(t, 10)}
+	case uint:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatUint(uint64(t), 10)}
+	case uint8:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatUint(uint64(t), 10)}
+	case uint16:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatUint(uint64(t), 10)}
+	case uint32:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatUint(uint64(t), 10)}
+	case uint64:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatUint(t, 10)}
 	case float64:
-		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: strconv.FormatFloat(t, 'g', -1, 64)}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: formatYAMLFloat(t)}
+	case json.Number:
+		tag := "!!int"
+		if strings.ContainsAny(string(t), ".eE") {
+			tag = "!!float"
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: string(t)}
 	case string:
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: t}
 
@@ -82,9 +99,13 @@ func encodeNodeLines(n *yaml.Node, indent int) ([]string, bool) {
 		_ = enc.Close()
 		return nil, false
 	}
-	_ = enc.Close()
+	if err := enc.Close(); err != nil {
+		return nil, false
+	}
 
-	s := strings.TrimRight(buf.String(), "\n")
+	// Remove only the encoder's document-terminating newline. Additional
+	// trailing newlines can be significant content in a |+ block scalar.
+	s := strings.TrimSuffix(buf.String(), "\n")
 	if s == "" {
 		return []string{}, true
 	}

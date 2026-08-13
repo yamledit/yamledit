@@ -51,6 +51,7 @@ func marshalBySurgery(
 	presentationOpaquePaths map[string]struct{},
 	baseIndent int,
 	deletions map[string]struct{},
+	forceScalarRewrite map[string]struct{},
 ) ([]byte, bool) {
 	if len(original) == 0 {
 		// No original content to patch
@@ -69,7 +70,11 @@ func marshalBySurgery(
 	}
 	for _, pk := range collectChangedKeysDeep(originalOrdered, current, nil) {
 		if _, unsafe := unsafePaths[pk]; unsafe {
-			return nil, false
+			segments, pathOK := splitJoinedPath(pk)
+			indexedScalar := pathOK && len(segments) >= 2 && isIndexPathSegment(segments[len(segments)-2]) && len(valIdx[pk]) > 0
+			if !indexedScalar {
+				return nil, false
+			}
 		}
 	}
 
@@ -86,6 +91,10 @@ func marshalBySurgery(
 		if !seqReplOK {
 			return nil, false
 		}
+		// A whole-sequence renderer can preserve descendant tags when it reuses
+		// the original bytes for surviving items. Keep the candidate and let
+		// Marshal's exact kind/tag validation decide; if a re-rendered item did
+		// lose an intent, the scoped live-AST rewrite still gets the fallback.
 		for _, p := range seqReplPatches {
 			p.seq = seq
 			seq++
@@ -94,7 +103,7 @@ func marshalBySurgery(
 
 		// 1) Replace ints/strings/bools/floats/null that changed (and existed originally),
 		//    including inside arrays of mappings. (Scalar arrays handled above now).
-		replaceOK, replPatches := buildReplacementPatches(original, current, originalOrdered, valIdx, seqIdx, replacedSeqs, unsafePaths)
+		replaceOK, replPatches := buildReplacementPatches(original, current, originalOrdered, valIdx, seqIdx, boundsIdx, replacedSeqs, unsafePaths, baseIndent, forceScalarRewrite)
 		if !replaceOK {
 			return nil, false
 		}
@@ -154,7 +163,7 @@ func marshalBySurgery(
 
 	if len(patches) == 0 {
 		// If we couldn't produce surgical patches but the logical doc changed,
-		// request a structured re‑encode (fallback). Otherwise keep original.
+		// request a scoped structural rewrite. Otherwise keep original.
 		if !logicalEqualOrdered(originalOrdered, current) {
 			return nil, false
 		}
@@ -208,7 +217,7 @@ func marshalBySurgery(
 	return out.Bytes(), true
 }
 
-// Compare logical structures (ignores scalar formatting). Used to decide fallback when
+// Compare logical structures (ignores scalar formatting). Used to decide when
 // no surgical patches were produced but the doc actually changed (e.g., array edits).
 func logicalEqualOrdered(a, b gyaml.MapSlice) bool {
 	return logicalValueEqual(a, b)
@@ -221,11 +230,15 @@ func logicalEqual(a, b interface{}) bool {
 func logicalValueEqual(a, b interface{}) bool {
 	a = toPlain(a)
 	b = toPlain(b)
+	if sameNumericCategory(a, b) && numericValueCategory(a) == numericCategoryFloat {
+		if aZero, aNegative := floatingZeroSign(a); aZero {
+			if bZero, bNegative := floatingZeroSign(b); bZero && aNegative != bNegative {
+				return false
+			}
+		}
+	}
 	if reflect.DeepEqual(a, b) {
 		return true
-	}
-	if numericIsNaN(a) || numericIsNaN(b) {
-		return numericIsNaN(a) && numericIsNaN(b)
 	}
 
 	switch av := a.(type) {
@@ -254,9 +267,69 @@ func logicalValueEqual(a, b interface{}) bool {
 		return true
 	}
 
+	// The ordered shadow is not merely a JSON-value view: it also determines
+	// which YAML scalar tag Marshal must emit. In particular, YAML integers and
+	// floats with the same mathematical value are observably different values.
+	// Keep integer widths interchangeable (the package normalizes them while
+	// editing), but never collapse integer, float, and string categories here.
+	if numericIsNaN(a) || numericIsNaN(b) {
+		return numericIsNaN(a) && numericIsNaN(b) && sameNumericCategory(a, b)
+	}
+	if !sameNumericCategory(a, b) {
+		return false
+	}
 	ar, okA := numericAsRat(a)
 	br, okB := numericAsRat(b)
 	return okA && okB && ar.Cmp(br) == 0
+}
+
+type numericCategory uint8
+
+const (
+	numericCategoryNone numericCategory = iota
+	numericCategoryInteger
+	numericCategoryFloat
+)
+
+func numericValueCategory(v interface{}) numericCategory {
+	switch n := v.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return numericCategoryInteger
+	case float32, float64:
+		return numericCategoryFloat
+	case json.Number:
+		if strings.ContainsAny(n.String(), ".eE") {
+			return numericCategoryFloat
+		}
+		return numericCategoryInteger
+	default:
+		return numericCategoryNone
+	}
+}
+
+func sameNumericCategory(a, b interface{}) bool {
+	category := numericValueCategory(a)
+	return category != numericCategoryNone && category == numericValueCategory(b)
+}
+
+func floatingZeroSign(value interface{}) (zero, negative bool) {
+	switch number := value.(type) {
+	case float32:
+		return number == 0, math.Signbit(float64(number))
+	case float64:
+		return number == 0, math.Signbit(number)
+	case json.Number:
+		if numericValueCategory(number) != numericCategoryFloat {
+			return false, false
+		}
+		rat, ok := new(big.Rat).SetString(number.String())
+		if !ok || rat.Sign() != 0 {
+			return false, false
+		}
+		return true, strings.HasPrefix(number.String(), "-")
+	default:
+		return false, false
+	}
 }
 
 func numericIsNaN(v interface{}) bool {
@@ -377,6 +450,56 @@ func hasUntrackedMappingRemoval(orig, cur interface{}, path []string, deletions 
 	return false
 }
 
+// hasStrictScalarPrefixAppend reports an append whose original sequence prefix
+// retains the same index and mapping structure. Scalar leaves may differ: those
+// are independently addressable by buildReplacementPatches. Keeping this test
+// deliberately narrow prevents an append patch from masking a collection edit
+// that no descendant patch can represent.
+func hasStrictScalarPrefixAppend(oldArr, newArr []interface{}) bool {
+	if len(newArr) <= len(oldArr) {
+		return false
+	}
+
+	var mappingPrefixCompatible func(gyaml.MapSlice, gyaml.MapSlice) bool
+	mappingPrefixCompatible = func(oldMap, newMap gyaml.MapSlice) bool {
+		if len(oldMap) != len(newMap) {
+			return false
+		}
+		for index := range oldMap {
+			oldKey, oldOK := oldMap[index].Key.(string)
+			newKey, newOK := newMap[index].Key.(string)
+			if !oldOK || !newOK || oldKey != newKey {
+				return false
+			}
+			oldValue, newValue := oldMap[index].Value, newMap[index].Value
+			if logicalValueEqual(oldValue, newValue) {
+				continue
+			}
+			if isScalarValue(oldValue) && isScalarValue(newValue) {
+				continue
+			}
+			oldNested, oldNestedOK := oldValue.(gyaml.MapSlice)
+			newNested, newNestedOK := newValue.(gyaml.MapSlice)
+			if !oldNestedOK || !newNestedOK || !mappingPrefixCompatible(oldNested, newNested) {
+				return false
+			}
+		}
+		return true
+	}
+
+	for index := range oldArr {
+		if logicalValueEqual(oldArr[index], newArr[index]) {
+			continue
+		}
+		oldMap, oldOK := oldArr[index].(gyaml.MapSlice)
+		newMap, newOK := newArr[index].(gyaml.MapSlice)
+		if !oldOK || !newOK || !mappingPrefixCompatible(oldMap, newMap) {
+			return false
+		}
+	}
+	return true
+}
+
 // Build patches for appending new items to sequences (arrays) at the end.
 // 'skipSeq' contains sequence paths (joinPath form) which are already replaced entirely.
 func buildSeqAppendPatches(
@@ -453,25 +576,32 @@ func buildSeqAppendPatches(
 			}
 		}
 		order := []string{}
+		seenOrder := map[string]struct{}{}
 		if len(si.keyOrder) > 0 {
-			order = append(order, si.keyOrder...)
-			for _, it := range ms {
-				ks, _ := it.Key.(string)
-				found := false
-				for _, k := range order {
-					if k == ks {
-						found = true
-						break
-					}
+			for _, key := range si.keyOrder {
+				_, seen := seenOrder[key]
+				if _, present := vals[key]; present && !seen {
+					order = append(order, key)
+					seenOrder[key] = struct{}{}
 				}
-				if !found {
+			}
+			for _, it := range ms {
+				ks, ok := it.Key.(string)
+				if !ok {
+					continue
+				}
+				if _, seen := seenOrder[ks]; !seen {
 					order = append(order, ks)
+					seenOrder[ks] = struct{}{}
 				}
 			}
 		} else {
 			for _, it := range ms {
 				if ks, ok := it.Key.(string); ok {
-					order = append(order, ks)
+					if _, seen := seenOrder[ks]; !seen {
+						order = append(order, ks)
+						seenOrder[ks] = struct{}{}
+					}
 				}
 			}
 		}
@@ -560,7 +690,12 @@ func buildSeqAppendPatches(
 				if nlen == olen {
 					continue
 				} // nothing appended
-				// Only handle pure append at end.
+				// Only handle an append whose existing prefix can be represented by
+				// independent scalar replacements. A whole-sequence patch handles all
+				// other prefix changes and records this path in skipSeq.
+				if !hasStrictScalarPrefixAppend(origArr, v) {
+					return false
+				}
 				mpath = joinPath(append(path, k))
 				si := seqIdx[mpath]
 				if si == nil || !si.originalPath || !si.hasAnyItem {
@@ -621,8 +756,11 @@ func buildReplacementPatches(
 	originalOrdered gyaml.MapSlice,
 	valIdx map[string][]valueOcc,
 	seqIdx map[string]*seqInfo,
+	boundsIdx map[string][]kvBounds,
 	skipSeq map[string]struct{},
 	unsafePaths map[string]struct{},
+	baseIndent int,
+	forceScalarRewrite map[string]struct{},
 ) (bool, []patch) {
 	allowsScalarSurgery := func(occ valueOcc, value interface{}) bool {
 		if occ.blockStyle || occ.multiline {
@@ -633,6 +771,66 @@ func buildReplacementPatches(
 		}
 		tag, ok := scalarYAMLTag(value)
 		return ok && tag == occ.tag
+	}
+	allowsForcedScalarSurgery := func(occ valueOcc, value interface{}) bool {
+		if occ.blockStyle || occ.multiline || occ.explicitTag {
+			return false
+		}
+		_, ok := scalarYAMLTag(value)
+		return ok
+	}
+	jsonNumberReplacementToken := func(occ valueOcc, value json.Number) []byte {
+		// scalarValueOffset excludes an existing explicit tag. Keep a compatible
+		// tag in the untouched prefix; otherwise renderJSONNumberToken must add one
+		// when YAML's resolver would treat a large JSON number as a string.
+		if occ.explicitTag {
+			return []byte(value.String())
+		}
+		return []byte(renderJSONNumberToken(value))
+	}
+	sequenceScalarExplicitTagStart := func(itemLineStart, valueStart int) (int, bool) {
+		if itemLineStart < 0 || valueStart <= itemLineStart || valueStart > len(original) {
+			return 0, false
+		}
+		pos := itemLineStart
+		for pos < valueStart && (original[pos] == ' ' || original[pos] == '\t') {
+			pos++
+		}
+		if pos >= valueStart || original[pos] != '-' {
+			return 0, false
+		}
+		pos++
+		if pos >= valueStart || (original[pos] != ' ' && original[pos] != '\t') {
+			return 0, false
+		}
+		for pos < valueStart && (original[pos] == ' ' || original[pos] == '\t') {
+			pos++
+		}
+		tagStart := pos
+		if tagStart >= valueStart || original[tagStart] != '!' {
+			return 0, false
+		}
+		if pos+1 < valueStart && original[pos+1] == '<' {
+			pos += 2
+			for pos < valueStart && original[pos] != '>' {
+				pos++
+			}
+			if pos >= valueStart {
+				return 0, false
+			}
+			pos++
+		} else {
+			for pos < valueStart && original[pos] != ' ' && original[pos] != '\t' {
+				pos++
+			}
+		}
+		for pos < valueStart && (original[pos] == ' ' || original[pos] == '\t') {
+			pos++
+		}
+		// Replacing one contiguous span is safe only when the explicit tag is
+		// the sole node property before the scalar. In particular, do not drop
+		// an anchor that aliases elsewhere in the document.
+		return tagStart, pos == valueStart
 	}
 	// Helper: get original string value for (path, key) from originalOrdered.
 	// path is a slice of mapping keys and possibly "[idx]" segments for array items.
@@ -712,7 +910,17 @@ func buildReplacementPatches(
 
 	emit := func(p patch, path []string, key string) bool {
 		if _, unsafe := unsafePaths[makePathKey(path, key)]; unsafe {
-			return false
+			// A compact mapping key (`- key: value`) owns the sequence dash, so its
+			// whole entry bound is unsafe for deletion/structural promotion. Replacing
+			// only the indexed scalar token remains safe and preserves the dash,
+			// comments, and every sibling. Other unsafe paths still fail closed.
+			if len(path) == 0 || !isIndexSeg(path[len(path)-1]) || p.start == p.end {
+				return false
+			}
+			occs := valIdx[makePathKey(path, key)]
+			if len(occs) == 0 || p.start != occs[len(occs)-1].valStart || p.end != occs[len(occs)-1].valEnd {
+				return false
+			}
 		}
 		if len(path) > 0 && isIndexSeg(path[len(path)-1]) {
 			itemPath := joinPath(path) // includes the [n]
@@ -732,6 +940,14 @@ func buildReplacementPatches(
 	var walkArr func(arr []interface{}, path []string) bool
 
 	walkArr = func(arr []interface{}, path []string) bool {
+		// A whole-sequence patch already covers every descendant. Do not compare
+		// surviving items against their old numeric positions: after an insertion,
+		// deletion, or reorder, that comparison can manufacture overlapping scalar
+		// patches or reject unchanged presentation (for example an explicit !!str)
+		// before emit() gets a chance to discard the patch.
+		if _, skip := skipSeq[joinPath(path)]; skip {
+			return true
+		}
 		for i, el := range arr {
 			seg := indexSeg(i)
 			switch ev := el.(type) {
@@ -742,12 +958,14 @@ func buildReplacementPatches(
 			// Arrays of scalars not supported surgically yet; fall through.
 			default:
 				// Handle arrays of scalars surgically: replace only the scalar token on its line.
-				// Skip if this entire sequence was already marked as fully replaced.
-				seqPath := joinPath(path)
-				if _, skip := skipSeq[seqPath]; skip {
-					continue
+				itemPath := append(append([]string{}, path...), seg)
+				_, forced := forceScalarRewrite[joinPath(itemPath)]
+				if !forced {
+					if originalValue, exists := orderedValueAtSegments(originalOrdered, itemPath); exists && logicalValueEqual(originalValue, ev) {
+						continue
+					}
 				}
-				pk := makeSeqPathKey(path, i, scalarItemKey)
+				pk := makeSeqItemPathKey(path, i)
 				occs := valIdx[pk]
 				if len(occs) == 0 {
 					// No original anchor for this index → probably an appended item.
@@ -755,18 +973,29 @@ func buildReplacementPatches(
 					continue
 				}
 				last := occs[len(occs)-1]
-				if !allowsScalarSurgery(last, ev) {
+				if last.valStart < 0 || last.valEnd < last.valStart || last.valEnd > len(original) {
+					return false
+				}
+				if forced {
+					if last.blockStyle || last.multiline {
+						return false
+					}
+					if _, ok := scalarYAMLTag(ev); !ok {
+						return false
+					}
+				} else if !allowsScalarSurgery(last, ev) {
 					return false
 				}
 
 				makeTok := func(oldTok []byte, v interface{}) []byte {
 					switch t := v.(type) {
-					case int:
-						return []byte(fmt.Sprintf("%d", t))
+					case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+						rendered, _ := renderScalarToken(t)
+						return []byte(rendered)
 					case float64:
 						return []byte(formatYAMLFloat(t))
 					case json.Number:
-						return []byte(string(t))
+						return jsonNumberReplacementToken(last, t)
 					case bool:
 						if t {
 							return []byte("true")
@@ -784,13 +1013,26 @@ func buildReplacementPatches(
 
 				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
 				newTok := makeTok(oldTok, ev)
+				replacementStart := last.valStart
+				if forced && last.explicitTag {
+					var ok bool
+					replacementStart, ok = sequenceScalarExplicitTagStart(last.keyLineStart, last.valStart)
+					if !ok {
+						return false
+					}
+					if number, ok := ev.(json.Number); ok {
+						// The old explicit tag is part of the replacement span, so a
+						// large number must emit any core tag its lexeme requires.
+						newTok = []byte(renderJSONNumberToken(number))
+					}
+				}
 
 				// Avoid churn if identical bytes
-				if bytes.Equal(oldTok, newTok) {
+				if bytes.Equal(bytes.TrimSpace(original[replacementStart:last.valEnd]), newTok) {
 					continue
 				}
 				patches = append(patches, patch{
-					start: last.valStart,
+					start: replacementStart,
 					end:   last.valEnd,
 					data:  newTok,
 				})
@@ -808,7 +1050,8 @@ func buildReplacementPatches(
 			if !ok {
 				continue
 			}
-			if isScalarValue(it.Value) {
+			_, forced := forceScalarRewrite[makePathKey(path, k)]
+			if isScalarValue(it.Value) && !forced {
 				if originalValue, exists := lookupOrigValue(path, k); exists {
 					bothNaN := false
 					if currentFloat, ok := it.Value.(float64); ok && math.IsNaN(currentFloat) {
@@ -816,7 +1059,47 @@ func buildReplacementPatches(
 							bothNaN = true
 						}
 					}
-					if bothNaN || deepEqual(originalValue, it.Value) {
+					if bothNaN || logicalValueEqual(originalValue, it.Value) {
+						continue
+					}
+				}
+			}
+			// Block and multiline flow scalars occupy more than the token range
+			// recorded for ordinary scalar surgery. When such a scalar is inside a
+			// retained sequence item, replace its complete mapping-entry bound. This
+			// composes safely with an insertion after the original sequence range and
+			// leaves every sibling field and item byte-for-byte untouched.
+			insideSequenceItem := false
+			for _, segment := range path {
+				if isIndexSeg(segment) {
+					insideSequenceItem = true
+					break
+				}
+			}
+			if insideSequenceItem && isScalarValue(it.Value) {
+				pk := makePathKey(path, k)
+				occs := valIdx[pk]
+				if len(occs) > 0 {
+					last := occs[len(occs)-1]
+					if last.blockStyle || last.multiline {
+						bounds := boundsIdx[pk]
+						if len(bounds) == 0 {
+							return false
+						}
+						bound := bounds[len(bounds)-1]
+						if bound.start < 0 || bound.end < bound.start || bound.end > len(original) {
+							return false
+						}
+						rendered, ok := renderKeyValue(original, k, it.Value, bound, baseIndent, nil, nil)
+						if !ok {
+							return false
+						}
+						if bytes.Equal(original[bound.start:bound.end], []byte(rendered)) {
+							continue
+						}
+						if !emit(patch{start: bound.start, end: bound.end, data: []byte(rendered)}, path, k) {
+							return false
+						}
 						continue
 					}
 				}
@@ -830,7 +1113,7 @@ func buildReplacementPatches(
 				if !walkArr(v, append(path, k)) {
 					return false
 				}
-			case int:
+			case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 				pk := makePathKey(path, k)
 				occs := valIdx[pk]
 				if len(occs) == 0 {
@@ -839,10 +1122,18 @@ func buildReplacementPatches(
 				}
 				// Replace the LAST occurrence (YAML semantics: last wins)
 				last := occs[len(occs)-1]
-				if !allowsScalarSurgery(last, v) {
+				if forced {
+					if !allowsForcedScalarSurgery(last, v) {
+						return false
+					}
+				} else if !allowsScalarSurgery(last, v) {
 					return false
 				}
-				newVal := []byte(fmt.Sprintf("%d", v))
+				rendered, ok := renderScalarToken(v)
+				if !ok {
+					return false
+				}
+				newVal := []byte(rendered)
 				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
 				// Avoid churn if identical
 				if bytes.Equal(oldTok, newVal) {
@@ -859,10 +1150,14 @@ func buildReplacementPatches(
 					continue
 				}
 				last := occs[len(occs)-1]
-				if !allowsScalarSurgery(last, v) {
+				if forced {
+					if !allowsForcedScalarSurgery(last, v) {
+						return false
+					}
+				} else if !allowsScalarSurgery(last, v) {
 					return false
 				}
-				newVal := []byte(string(v))
+				newVal := jsonNumberReplacementToken(last, v)
 				oldTok := bytes.TrimSpace(original[last.valStart:last.valEnd])
 				if bytes.Equal(oldTok, newVal) {
 					continue
@@ -895,7 +1190,11 @@ func buildReplacementPatches(
 					// find the original value). We can't do safe byte-surgery here.
 					return false
 				}
-				if !allowsScalarSurgery(last, v) {
+				if forced {
+					if !allowsForcedScalarSurgery(last, v) {
+						return false
+					}
+				} else if !allowsScalarSurgery(last, v) {
 					return false
 				}
 
@@ -915,7 +1214,11 @@ func buildReplacementPatches(
 					continue // new key; handled by insertion
 				}
 				last := occs[len(occs)-1]
-				if !allowsScalarSurgery(last, v) {
+				if forced {
+					if !allowsForcedScalarSurgery(last, v) {
+						return false
+					}
+				} else if !allowsScalarSurgery(last, v) {
 					return false
 				}
 				var newTok []byte
@@ -939,7 +1242,11 @@ func buildReplacementPatches(
 					continue
 				}
 				last := occs[len(occs)-1]
-				if !allowsScalarSurgery(last, v) {
+				if forced {
+					if !allowsForcedScalarSurgery(last, v) {
+						return false
+					}
+				} else if !allowsScalarSurgery(last, v) {
 					return false
 				}
 				newTok := []byte(formatYAMLFloat(v))
@@ -958,7 +1265,11 @@ func buildReplacementPatches(
 					continue
 				}
 				last := occs[len(occs)-1]
-				if !allowsScalarSurgery(last, v) {
+				if forced {
+					if !allowsForcedScalarSurgery(last, v) {
+						return false
+					}
+				} else if !allowsScalarSurgery(last, v) {
 					return false
 				}
 				newTok := []byte("null")
@@ -971,7 +1282,7 @@ func buildReplacementPatches(
 				}
 
 			default:
-				// We only byte-patch ints; anything else is left untouched by surgery
+				// Complex values are handled by container rewrites or insertion paths.
 				continue
 			}
 		}
@@ -1182,15 +1493,19 @@ func buildSeqReplaceBlockPatches(
 		return out, true
 	}
 
-	getName := func(ms gyaml.MapSlice) string {
-		for _, it := range ms {
-			if ks, ok := it.Key.(string); ok && ks == "name" {
-				if sv, ok2 := scalarToString(it.Value); ok2 {
-					return sv
+	getItemIdentity := func(item interface{}) (string, bool) {
+		if ms, ok := toMapSlice(item); ok {
+			for _, it := range ms {
+				if ks, ok := it.Key.(string); ok && ks == "name" {
+					return scalarToString(it.Value)
 				}
 			}
+			// Mapping items without a usable name do not have a stable identity.
+			// An empty scalar name is still usable: the boolean result distinguishes
+			// it from a missing name, and occurrence matching handles ambiguity.
+			return "", false
 		}
-		return ""
+		return scalarToString(item)
 	}
 
 	renderScalar := func(v interface{}) string {
@@ -1208,25 +1523,32 @@ func buildSeqReplaceBlockPatches(
 			}
 		}
 		order := []string{}
+		seenOrder := map[string]struct{}{}
 		if len(si.keyOrder) > 0 {
-			order = append(order, si.keyOrder...)
-			for _, it := range ms {
-				ks, _ := it.Key.(string)
-				found := false
-				for _, k := range order {
-					if k == ks {
-						found = true
-						break
-					}
+			for _, key := range si.keyOrder {
+				_, seen := seenOrder[key]
+				if _, present := vals[key]; present && !seen {
+					order = append(order, key)
+					seenOrder[key] = struct{}{}
 				}
-				if !found {
+			}
+			for _, it := range ms {
+				ks, ok := it.Key.(string)
+				if !ok {
+					continue
+				}
+				if _, seen := seenOrder[ks]; !seen {
 					order = append(order, ks)
+					seenOrder[ks] = struct{}{}
 				}
 			}
 		} else {
 			for _, it := range ms {
 				if ks, ok := it.Key.(string); ok {
-					order = append(order, ks)
+					if _, seen := seenOrder[ks]; !seen {
+						order = append(order, ks)
+						seenOrder[ks] = struct{}{}
+					}
 				}
 			}
 		}
@@ -1321,10 +1643,28 @@ func buildSeqReplaceBlockPatches(
 			}
 		}
 
-		// Fallback: we don't have stable identities (e.g. routes without "name").
-		// Compare the logical contents; if they are identical, we MUST NOT
-		// rewrite the block, or we risk corrupting nested structures like
-		// "paths" lists.
+		// Without stable identities, equal-length mapping arrays still retain
+		// their index provenance: JSON Patch descendant edits address that exact
+		// item, and field insertion/replacement helpers have index-aware source
+		// bounds. Do not turn an ordinary field edit into a lossy whole-sequence
+		// rewrite merely because the mapping has no conventional "name" key.
+		allMappings := true
+		for i := range oldArr {
+			if _, oldOK := toMapSlice(oldArr[i]); !oldOK {
+				allMappings = false
+				break
+			}
+			if _, newOK := toMapSlice(newArr[i]); !newOK {
+				allMappings = false
+				break
+			}
+		}
+		if allMappings {
+			return false
+		}
+
+		// Other arrays without identities need a whole block rewrite when their
+		// logical values differ (notably scalar arrays, where value is identity).
 		return !logicalValueEqual(oldArr, newArr)
 	}
 
@@ -1363,6 +1703,14 @@ func buildSeqReplaceBlockPatches(
 					// For scalars, if shape didn't change, values (identities) are the same, so nothing to do.
 					continue
 				}
+				// An append with an index-stable mapping prefix does not require
+				// reconstructing any original item. Scalar leaf edits in that prefix
+				// are emitted independently, while buildSeqAppendPatches inserts after
+				// the original range. This preserves comments, aliases, anchors, tags,
+				// and scalar spelling on every untouched field and item.
+				if hasStrictScalarPrefixAppend(origArr, v) {
+					continue
+				}
 				if _, opaque := opaquePaths[mpath]; opaque {
 					return false
 				}
@@ -1395,18 +1743,26 @@ func buildSeqReplaceBlockPatches(
 							used := make([]bool, len(origArr))
 							safe = true
 							for i, name := range newNames {
-								matched := false
+								matchedIndex := -1
 								for j, oldName := range oldNames {
 									if !used[j] && name == oldName && logicalValueEqual(v[i], origArr[j]) {
-										used[j] = true
-										matched = true
-										break
+										if matchedIndex >= 0 {
+											// Two indistinguishable logical values can carry different
+											// comments or scalar styles. The ordered shadow has lost
+											// which occurrence survived an index deletion, so choosing
+											// either original byte range would risk preserving metadata
+											// from the removed item. Fail safely instead.
+											matchedIndex = -2
+											break
+										}
+										matchedIndex = j
 									}
 								}
-								if !matched {
+								if matchedIndex < 0 {
 									safe = false
 									break
 								}
+								used[matchedIndex] = true
 							}
 						}
 					}
@@ -1457,54 +1813,34 @@ func buildSeqReplaceBlockPatches(
 				// We rely on si.items having the correct length and names captured during indexing.
 				if len(si.items) == O {
 					for i := 0; i < O; i++ {
-						identity := si.items[i].name
-						if identity != "" {
+						identity, hasIdentity := getItemIdentity(origArr[i])
+						if hasIdentity {
 							ctx := origItemContext{index: i, info: si.items[i], data: origArr[i]}
 							origItemsByIdentity[identity] = append(origItemsByIdentity[identity], ctx)
 						}
 					}
 				}
 
-				// Build "pre-gap" map for fallback rendering if surgery isn't possible for an item.
-				preGap := map[string][]byte{}
-				if len(si.items) >= 2 && len(si.gaps) == len(si.items)-1 {
-					for i := 0; i < len(si.items)-1; i++ {
-						nextName := si.items[i+1].name
-						if nextName == "" {
-							continue
-						}
-						g := si.gaps[i]
-						if len(g) > 0 {
-							// Associate gap with the identity of the item that followed it.
-							if _, exists := preGap[nextName]; !exists {
-								preGap[nextName] = g
-							}
-						}
-					}
-				}
-
-				// Helper for fallback identity extraction
-				getItemIdentity := func(item interface{}) string {
-					if ms, ok := toMapSlice(item); ok {
-						return getName(ms)
-					}
-					if sv, ok := scalarToString(item); ok {
-						return sv
-					}
-					return ""
-				}
-
 				// Render new block
 				var sb strings.Builder
 				// Keep track of used original items by index.
 				usedOriginalItems := make(map[int]bool)
+				usedOriginalGaps := make(map[int]bool)
+				writeOriginalPreGap := func(originalIndex int) {
+					gapIndex := originalIndex - 1
+					if gapIndex < 0 || gapIndex >= len(si.gaps) || usedOriginalGaps[gapIndex] {
+						return
+					}
+					sb.Write(si.gaps[gapIndex])
+					usedOriginalGaps[gapIndex] = true
+				}
 
 				for i, el := range v {
 
 					// Preservation Logic for Existing, Unchanged Items (Identity-Based).
 					// If an item existed and hasn't changed content, reuse its original bytes to prevent churn.
-					identity := getItemIdentity(el)
-					if identity != "" {
+					identity, hasIdentity := getItemIdentity(el)
+					if hasIdentity {
 						// Check if there are available original occurrences for this identity.
 						if contexts, found := origItemsByIdentity[identity]; found && len(contexts) > 0 {
 							// Try to find an unused context that matches the content.
@@ -1515,13 +1851,10 @@ func buildSeqReplaceBlockPatches(
 									if logicalValueEqual(ctx.data, el) {
 										// Found an unused, identical original item. Reuse original bytes.
 
-										// 1. Preserve preceding Gap using preGap map.
-										// preGap stores the gap for the first occurrence of an identity.
-										if g, ok := preGap[identity]; ok && len(g) > 0 {
-											sb.Write(g)
-											// Consume gap if used (only once per identity).
-											delete(preGap, identity)
-										}
+										// A gap belongs to a particular original occurrence, not merely
+										// to its logical identity. Duplicate names can otherwise resurrect
+										// a deleted item's head comment on a retained sibling.
+										writeOriginalPreGap(ctx.index)
 
 										// 2. Write the original item bytes.
 										start := ctx.info.start
@@ -1578,7 +1911,7 @@ func buildSeqReplaceBlockPatches(
 								last := occs[len(occs)-1]
 								itemInfo := si.items[i]
 								desiredTag, tagOK := scalarYAMLTag(el)
-								if last.blockStyle || (last.explicitTag && (!tagOK || desiredTag != last.tag)) {
+								if last.blockStyle || last.multiline || (last.explicitTag && (!tagOK || desiredTag != last.tag)) {
 									// Re-render this item instead of replacing only the block
 									// header or leaving an incompatible explicit tag behind.
 								} else {
@@ -1630,13 +1963,13 @@ func buildSeqReplaceBlockPatches(
 
 					// Fallback rendering (for appends, mappings, or when surgery failed/not applicable).
 
-					// Try to preserve gaps using the identity-based preGap map (useful if reordering occurred).
-					nm := getItemIdentity(el)
-					if nm != "" {
-						if g, ok := preGap[nm]; ok && len(g) > 0 {
-							sb.Write(g)
-							// Consume gap if used.
-							delete(preGap, nm)
+					// If a changed item has a unique original identity, its preceding gap
+					// remains unambiguous. Duplicate identities require an exact-content
+					// match above; guessing here can attach deleted presentation metadata.
+					nm, hasIdentity := getItemIdentity(el)
+					if hasIdentity {
+						if contexts := origItemsByIdentity[nm]; len(contexts) == 1 {
+							writeOriginalPreGap(contexts[0].index)
 						}
 					}
 
@@ -1692,9 +2025,26 @@ func buildInsertPatches(
 ) (bool, []patch) {
 	var patches []patch
 
-	// Build a quick set of original keys per path for "is new?" checks
+	// Build a quick set of original keys per path for "is new?" checks. Keep
+	// arrays by path as well so current sequence items are only matched to an
+	// original mapping at the same index; appended items are handled separately
+	// by buildSeqAppendPatches.
 	origKeys := map[string]map[string]struct{}{}
+	origArrays := map[string][]interface{}{}
 	var collect func(ms gyaml.MapSlice, path []string)
+	var collectArray func(arr []interface{}, path []string)
+	collectArray = func(arr []interface{}, path []string) {
+		origArrays[joinPath(path)] = arr
+		for index, item := range arr {
+			itemPath := append(append([]string(nil), path...), indexSeg(index))
+			switch value := item.(type) {
+			case gyaml.MapSlice:
+				collect(value, itemPath)
+			case []interface{}:
+				collectArray(value, itemPath)
+			}
+		}
+	}
 	collect = func(ms gyaml.MapSlice, path []string) {
 		if origKeys[joinPath(path)] == nil {
 			origKeys[joinPath(path)] = map[string]struct{}{}
@@ -1702,16 +2052,60 @@ func buildInsertPatches(
 		for _, it := range ms {
 			if k, ok := it.Key.(string); ok {
 				origKeys[joinPath(path)][k] = struct{}{}
-				if sub, ok2 := it.Value.(gyaml.MapSlice); ok2 {
-					collect(sub, append(path, k))
+				switch value := it.Value.(type) {
+				case gyaml.MapSlice:
+					collect(value, append(path, k))
+				case []interface{}:
+					collectArray(value, append(path, k))
 				}
 			}
 		}
 	}
 	collect(originalOrdered, nil)
 
+	// A sequence index is only a reliable byte anchor while all of the fields
+	// that existed in the original item still have the same values. This allows
+	// direct field additions, but leaves item replacement/reordering and combined
+	// edits to the sequence rewrite path.
+	mappingRetainsOriginalValues := func(originalMap, currentMap gyaml.MapSlice) bool {
+		for originalIndex, item := range originalMap {
+			if orderedItemIsShadowed(originalMap, originalIndex) {
+				continue
+			}
+			key, ok := item.Key.(string)
+			if !ok {
+				return false
+			}
+			currentValue, exists := findLast(currentMap, key)
+			if !exists || !logicalValueEqual(item.Value, currentValue) {
+				return false
+			}
+		}
+		return true
+	}
+
 	// Walk current and insert new scalars at the end of their mapping
 	var walk func(ms gyaml.MapSlice, path []string) bool
+	var walkArray func(arr []interface{}, path []string) bool
+	walkArray = func(arr []interface{}, path []string) bool {
+		originalArray, exists := origArrays[joinPath(path)]
+		if !exists {
+			return true
+		}
+		limit := min(len(arr), len(originalArray))
+		for index := 0; index < limit; index++ {
+			currentMap, currentIsMap := arr[index].(gyaml.MapSlice)
+			originalMap, originalIsMap := originalArray[index].(gyaml.MapSlice)
+			if !currentIsMap || !originalIsMap || !mappingRetainsOriginalValues(originalMap, currentMap) {
+				continue
+			}
+			itemPath := append(append([]string(nil), path...), indexSeg(index))
+			if !walk(currentMap, itemPath) {
+				return false
+			}
+		}
+		return true
+	}
 	walk = func(ms gyaml.MapSlice, path []string) bool {
 		mpath := joinPath(path)
 		for itemIndex, it := range ms {
@@ -1760,7 +2154,7 @@ func buildInsertPatches(
 				if !walk(v, append(path, k)) {
 					return false
 				}
-			case int:
+			case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 				// New key?
 				if _, existed := origKeys[mpath][k]; !existed {
 					mi := mapIdx[mpath]
@@ -1775,7 +2169,11 @@ func buildInsertPatches(
 					if indent == 0 && len(path) > 0 {
 						indent = baseIndent * len(path)
 					}
-					line := fmt.Sprintf("%s%s: %d\n", strings.Repeat(" ", indent), renderMappingKey(k), v)
+					valueToken, ok := renderScalarToken(v)
+					if !ok {
+						return false
+					}
+					line := fmt.Sprintf("%s%s: %s\n", strings.Repeat(" ", indent), renderMappingKey(k), valueToken)
 					insertPos := mi.lastLineEnd + 1
 					if insertPos < 0 || insertPos > len(original) {
 						return false
@@ -1872,7 +2270,7 @@ func buildInsertPatches(
 					if indent == 0 && len(path) > 0 {
 						indent = baseIndent * len(path)
 					}
-					line := fmt.Sprintf("%s%s: %s\n", strings.Repeat(" ", indent), renderMappingKey(k), string(v))
+					line := fmt.Sprintf("%s%s: %s\n", strings.Repeat(" ", indent), renderMappingKey(k), renderJSONNumberToken(v))
 					insertPos := mi.lastLineEnd + 1
 					if insertPos < 0 || insertPos > len(original) {
 						return false
@@ -1886,15 +2284,19 @@ func buildInsertPatches(
 				// New sequence key?
 				if _, existed := origKeys[mpath][k]; existed {
 					// If the key already existed in the original, we don't handle
-					// it as a "new key" insertion. Apps/changes to its items are
-					// handled via the sequence surgery helpers.
+					// it as a "new key" insertion. Recurse only into corresponding
+					// original mapping items; appended items remain the sequence
+					// append helper's responsibility.
+					if !walkArray(v, append(path, k)) {
+						return false
+					}
 					continue
 				}
 
 				mi := mapIdx[mpath]
 				if mi == nil || !mi.originalPath || !mi.hasAnyKey {
 					// No stable anchor inside this mapping to attach the new block.
-					// We can't safely insert bytes here → bail out to fallback.
+					// We can't safely insert bytes here; let the scoped renderer try.
 					return false
 				}
 
@@ -1973,13 +2375,13 @@ func buildDeletionPatches(original []byte, deletions map[string]struct{}, bounds
 		bounds := boundsIdx[pk]
 		if len(bounds) == 0 {
 			// Key didn’t exist in original → no surgical deletion to make.
-			// Not an error: fallback encoder will already have removed from the logical map.
+			// Not an error: a later scoped rewrite can remove the logical key.
 			continue
 		}
 		for _, b := range bounds {
 			// Sanity check boundaries.
 			if b.start < 0 || b.end > len(original) || b.end < b.start {
-				// Invalid boundary indexed, potentially unsafe surgery. Fallback.
+				// Invalid boundary indexed, potentially unsafe surgery.
 				return false, nil
 			}
 			// The kvBounds struct already defines the exact start and exclusive end of the block.

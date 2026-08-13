@@ -9,7 +9,8 @@ Think: *change exactly the bytes you mean to - leave everything else untouched.*
   comments.
 - **Append without reflow.** Insert new keys/items at the _right_ indent and position.
 - **JSON Patch built‑in.** Apply RFC‑6902 patches (optionally at a base path) with minimal diffs when safe.
-- **Thread‑safe.** Concurrent edits are safe.
+- **Thread‑safe APIs.** Concurrent calls through yamledit’s mutators and `Marshal` are synchronized for documents
+  returned by `Parse`.
 
 > **Why not parse & re‑encode?** Re‑encoding churns quotes, spaces, and comment whitespace. `yamledit` indexes exact
 > byte positions so unrelated lines are **byte‑for‑byte identical**.
@@ -59,7 +60,7 @@ func main() {
 	// 4) Delete keys surgically (removes full blocks, including arrays)
 	yamledit.DeleteKey(env, "OLD_FLAG")
 
-	// 5) Marshal back (surgery when safe; structured fallback when needed)
+	// 5) Marshal back (surgery when safe; scoped rewrite when needed)
 	out, err := yamledit.Marshal(doc)
 	if err != nil {
 		panic(err)
@@ -113,8 +114,10 @@ env:
   Parse bytes into a `yaml.Node`. Top‑level **must** be a mapping (empty input creates an empty mapping document).
 
 * `Marshal(doc *yaml.Node) ([]byte, error)`
-  Serialize back to bytes. Performs **byte‑surgical** edits when safe, and **falls back** to AST encode when structure
-  changes—still preserving comments, indent, and key order.
+  Serialize back to bytes. Edits made through this package use byte surgery or a scoped per-key/sequence rewrite; if
+  neither is safe, `Marshal` returns an error instead of reformatting the whole source. If you mutate fields on the
+  returned `yaml.Node` directly, `Marshal` encodes that live AST globally so it does not silently ignore the change;
+  direct AST edits may therefore reflow formatting outside the changed node.
 
 * `EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node`
   Navigate/create nested mappings, starting from a `DocumentNode` **or** an inner `MappingNode`. Returns the mapping
@@ -134,7 +137,12 @@ env:
 ### Generic value setters
 
 * `SetValue(mapNode *yaml.Node, key string, value any, opts SetValueOptions)`
-  Writes a scalar, mapping, or sequence value under a mapping key.
+  Replaces the value under a mapping key with a scalar, mapping, or sequence. Signed and unsigned Go integers are
+  written as YAML integers; `float32`/`float64` remain YAML floats even when integral; valid `json.Number` values retain
+  their numeric category and spelling. Empty slices and maps are written as `[]` and `{}`. A `nil` value deletes the
+  key. A `map[string]any` is a complete replacement; use `SetMapValues` when you want to merge individual fields into
+  an existing mapping. Cyclic, excessively deep, or oversized caller collections are bounded; because this setter has
+  no error return, an unrepresentable branch is emitted as a quoted diagnostic string rather than recursed indefinitely.
 
 * `SetMapValues(mapNode *yaml.Node, fields map[string]any, opts SetValueOptions)`
   Writes multiple arbitrary values into a mapping node.
@@ -143,7 +151,8 @@ env:
   Writes multiple string values into a mapping node.
 
 * `SetValueOptions{DeleteEmptyStrings bool, SortKeys bool}`
-  Controls whether empty strings delete keys and whether map keys are written in lexical order.
+  Controls whether empty string mapping fields are omitted/deleted and whether map keys are written in lexical order.
+  Empty strings used as positional sequence elements are retained.
 
 Example:
 
@@ -162,8 +171,8 @@ yamledit.SetMapValues(spec, map[string]any{
 
 * `DeleteKey(mapNode *yaml.Node, key string)`
   Removes **all occurrences** of the key under that mapping. Deletion uses pre‑indexed start/end byte boundaries to
-  remove the entire block (scalars, mappings, or arrays). If surgery isn’t possible, fallback marshal still removes the
-  key without churning unrelated lines.
+  remove the entire block (scalars, mappings, or arrays). If neither exact deletion nor a safe scoped rewrite is
+  possible, `Marshal` returns an error rather than reformatting unrelated lines.
 
 ### JSON Patch (RFC‑6902)
 
@@ -177,7 +186,11 @@ yamledit.SetMapValues(spec, map[string]any{
 * `basePath` lets you interpret each op’s pointer **relative** to a mapping path (e.g. `[]string{"service","envs"}`).
 * Arrays: targeted edits (`/0/property`, `/-` appends) often remain **surgical**. Whole‑array replaces may fall back.
 * Root-target mutations (`path: ""`) are rejected because edited documents must keep a mapping root; root `test` is supported.
-* An alias value can be tested or copied, but paths do not traverse through an alias into its target mapping.
+* Copying from the root (`from: ""`) to a non-root path is supported; moving from the root is rejected.
+* An alias value can be tested or copied, but paths do not traverse through an alias into its target mapping. Copy
+  materializes the alias’s resolved JSON-compatible value; it does not create another YAML alias.
+* YAML-only values or presentation metadata can make an operation unsupported. For example, `move` rejects a source
+  carrying a custom tag, anchor, alias, comment, or non-default scalar style instead of silently discarding it.
 
 **Example: replace a field inside an array item (single‑line diff)**
 
@@ -199,16 +212,23 @@ out, _ := yamledit.Marshal(doc)
 
 ## Guarantees & design choices
 
-* **Comments preserved.** Header, foot, and inline (`# ...`) comments are preserved; unrelated lines are byte‑stable.
+* **Comments preserved.** For edits made through this package, header, foot, and inline (`# ...`) comments are
+  preserved; unrelated lines are byte‑stable.
 * **Indent preserved.** Base indent auto‑detected (2/3/4/…); indentless sequences supported; new content matches
   original style.
 * **Key order preserved.** Original order is maintained; **new keys are appended** to their mapping.
-* **Duplicates deduped on write.** If the original contained duplicate keys, only the **last** occurrence remains after
-  marshal (YAML semantics: last wins). This changes bytes but not meaning.
+* **Duplicates deduped when safe.** When exact source bounds are available, earlier duplicate keys are removed and the
+  **last** occurrence remains (YAML semantics: last wins). Duplicates in source forms that cannot be bounded safely are
+  preserved rather than risking removal of neighboring content.
 * **Booleans normalize on edit.** A key you edit with `SetScalarBool` (or via JSON Patch) will render as bare `true`/
   `false` even if previously quoted. Unrelated booleans remain untouched.
-* **No global re‑encode.** If surgery and scoped rewrites are not possible, `Marshal` returns an error instead of
-  reformatting the whole document. All rewrites are per‑key/sequence, using recorded bounds.
+* **No global re‑encode for package edits.** Mutations made through `EnsurePath`, setters, `DeleteKey`, or JSON Patch use
+  surgery or per-key/sequence rewrites based on recorded bounds. If those are unsafe, `Marshal` returns an error.
+  Direct field changes to the returned `yaml.Node` are the exception: because they bypass the edit index, `Marshal`
+  globally encodes the live AST to honor them, which may reflow formatting.
+* **Direct AST access is caller-synchronized.** Do not mutate fields on the returned `yaml.Node` concurrently with
+  yamledit API calls. The thread-safety guarantee covers calls made through the package APIs, not unsynchronized raw
+  field writes.
 * **Sequence append/delete supported.** Scalar arrays can be appended to or truncated surgically; complex reorders may
   still be unsupported and will error rather than churn bytes.
 

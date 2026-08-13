@@ -35,28 +35,31 @@ func effectiveIndentAt(original []byte, start int) int {
 	return ind
 }
 
+// Marshal serializes a mapping document. Mutations made through yamledit APIs
+// are emitted with byte surgery or scoped rewrites; if neither is safe, Marshal
+// returns an error rather than globally reformatting the source. Direct changes
+// to fields on the returned yaml.Node bypass the edit index, so Marshal encodes
+// the live AST globally to honor them and may reflow unrelated formatting.
 func Marshal(doc *yaml.Node) ([]byte, error) {
 	st, ok := lookup(doc)
 	if !ok {
-		// Fallback if somehow not registered
-		if err := validateYAMLAliasGraph(doc); err != nil {
+		// Standalone caller-constructed nodes do not have Parse's structural
+		// guarantees. Validate before invoking yaml.v3: its encoder otherwise
+		// ignores an unmatched mapping child and panics on nil children.
+		if err := validateYAMLMarshalDocument(doc); err != nil {
 			return nil, err
 		}
-		var buf bytes.Buffer
-		enc := yaml.NewEncoder(&buf)
-		enc.SetIndent(2)
-		if err := enc.Encode(doc); err != nil {
-			_ = enc.Close()
+		out, err := standardEncode(doc, 2)
+		if err != nil {
 			return nil, err
 		}
-		if err := enc.Close(); err != nil {
-			return nil, err
-		}
-		return buf.Bytes(), nil
+		return validateEditedOutput(out)
 	}
 
 	st.mu.RLock()
-	if err := validateYAMLAliasGraph(doc); err != nil {
+	// A caller may mutate the returned AST directly. Revalidate the complete
+	// serializable graph while it is locked before indexing or encoding it.
+	if err := validateYAMLMarshalDocument(doc); err != nil {
 		st.mu.RUnlock()
 		return nil, err
 	}
@@ -64,17 +67,48 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		st.mu.RUnlock()
 		return nil, err
 	}
+	// The ordered shadow drives byte-diff selection, but the live AST is the
+	// semantic authority. In particular, its Alias nodes resolve through the
+	// current anchor target while the deliberately detached ordered shadow keeps
+	// each alias expansion independent. Snapshot the live meaning while holding
+	// the document lock and use it to verify every generated patch below.
+	liveValue, err := yamlNodeToOrderedValue(doc.Content[0])
+	if err != nil {
+		st.mu.RUnlock()
+		return nil, fmt.Errorf("yamledit: cannot snapshot live YAML semantics: %w", err)
+	}
+	semanticExpected, ok := liveValue.(gyaml.MapSlice)
+	if !ok {
+		st.mu.RUnlock()
+		return nil, fmt.Errorf("yamledit: live document root is not a mapping")
+	}
+	if err := validateOrderedUTF8(semanticExpected); err != nil {
+		st.mu.RUnlock()
+		return nil, err
+	}
+	// Public mutators update expectedAST while holding this same state lock. A
+	// mismatch therefore means the caller changed the returned yaml.Node tree
+	// directly. Compare the graph and presentation, not only projected values:
+	// tags, styles, comments, anchors, alias targets, duplicate keys, and complex
+	// keys are all observable YAML state that an ordered-map shadow cannot carry.
+	directASTMutation := st.directASTDirty || !yamlNodeGraphEqual(doc, st.expectedAST)
+	marshalOrdered := st.ordered
 	if len(st.original) == 0 {
 		// Encode the live AST while holding the read lock. Snapshotting is not
 		// sufficient for a new document because the encoder traverses doc itself.
 		out, err := standardEncode(doc, st.indent)
 		st.mu.RUnlock()
-		return out, err
+		if err != nil {
+			return nil, err
+		}
+		return validateEditedOutput(out, semanticExpected)
 	}
 	if st.originalTriviaOnly {
-		if logicalEqualOrdered(st.origOrdered, st.ordered) {
+		if !directASTMutation && logicalEqualOrdered(st.origOrdered, marshalOrdered) {
 			out := append([]byte(nil), st.original...)
 			st.mu.RUnlock()
+			// A trivia-only source intentionally represents the package's
+			// synthetic empty mapping even though a YAML decoder reports EOF.
 			return out, nil
 		}
 		encoded, err := standardEncode(doc, st.indent)
@@ -93,22 +127,33 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		}
 		out = append(out, encoded...)
 		st.mu.RUnlock()
-		return validateEditedOutput(out)
+		return validateEditedOutput(out, semanticExpected)
+	}
+	// A direct edit must be encoded from the live AST before any source-surgical
+	// shortcut. This also preserves custom tags/anchors inserted into `{}` and
+	// presentation-only edits whose projected value did not change.
+	if directASTMutation {
+		out, err := standardEncode(doc, st.indent)
+		st.mu.RUnlock()
+		if err != nil {
+			return nil, err
+		}
+		return validateEditedOutput(out, semanticExpected)
 	}
 	if st.originalRootEmpty {
 		// An explicit `{}` root has no stable key-line anchor for surgery. Keep
 		// the exact input for a net-zero edit; otherwise encode the live AST while
 		// it is protected by the state lock.
-		if logicalEqualOrdered(st.origOrdered, st.ordered) {
+		if logicalEqualOrdered(st.origOrdered, marshalOrdered) {
 			out := append([]byte(nil), st.original...)
 			st.mu.RUnlock()
-			return out, nil
+			return validateEditedOutput(out, semanticExpected)
 		}
 		if st.rootTokenEnd <= st.rootTokenStart || st.rootTokenEnd > len(st.original) {
 			st.mu.RUnlock()
 			return nil, fmt.Errorf("yamledit: cannot safely replace explicit empty root mapping")
 		}
-		rootValue := orderedToYAMLNode(cloneMapSlice(st.ordered))
+		rootValue := orderedToYAMLNode(cloneMapSlice(marshalOrdered))
 		// Only the original `{}` token is replaced. Keeping the replacement in
 		// flow form prevents a preceding root tag or anchor (`!T {}`, `&a {}`)
 		// from binding to the first inserted key instead of the root mapping.
@@ -126,9 +171,9 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		return validateEditedOutput(out)
+		return validateEditedOutput(out, semanticExpected)
 	}
-	ordered := cloneMapSlice(st.ordered) // snapshot
+	ordered := cloneMapSlice(marshalOrdered) // snapshot
 	indent := st.indent
 	original := st.original
 	mapIdx := cloneMapIndex(st.mapIndex)
@@ -154,32 +199,66 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		opaquePaths[path] = struct{}{}
 	}
 	origOrdered := cloneMapSlice(st.origOrdered)
+	liveRootSnapshot := cloneYAMLNodeGraph(doc.Content[0])
 	delSet := make(map[string]struct{}, len(st.toDelete))
+	forceScalarRewrite := make(map[string]struct{}, len(st.forceScalarRewrite))
+	nodeRewriteTargets := activeNodeRewriteIntentsLocked(st, doc.Content[0])
 	seqIdx := cloneSeqIndex(st.seqIndex)
 	for k := range st.toDelete {
 		delSet[k] = struct{}{}
 	}
-	structuralDirty := st.structuralDirty
+	for path := range st.forceScalarRewrite {
+		segments, ok := splitJoinedPath(path)
+		if !ok {
+			continue
+		}
+		value, exists := orderedValueAtSegments(st.ordered, segments)
+		tag, scalar := scalarYAMLTag(value)
+		if exists && scalar && tag == st.forceScalarTags[path] {
+			forceScalarRewrite[path] = struct{}{}
+			// Forced scalar tags are output invariants, not merely renderer
+			// hints. This is especially important for scalar items in mixed
+			// sequences, which intentionally have no byte-token index: an
+			// unchanged surgical candidate must be rejected if it retains the
+			// original custom tag.
+			nodeRewriteTargets[path] = yamlNodeSignature{kind: yaml.ScalarNode, tag: tag, exists: true}
+		}
+	}
+	for path := range nodeRewriteTargets {
+		forceScalarRewrite[path] = struct{}{}
+	}
 	rootMappingEmpty := doc != nil && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0
 	st.mu.RUnlock()
 
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, unsafePaths, semanticOpaquePaths, presentationOpaquePaths, indent, delSet)
-	if okPatch && (!structuralDirty || (bytes.Equal(out, original) && logicalEqualOrdered(origOrdered, ordered))) {
-		validated, err := validateEditedOutput(out)
-		if err != nil {
-			return nil, err
+	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, unsafePaths, semanticOpaquePaths, presentationOpaquePaths, indent, delSet, forceScalarRewrite)
+	var surgicalValidationErr error
+	if okPatch {
+		validated, err := validateEditedOutputWithNodeIntents(out, nodeRewriteTargets, semanticExpected)
+		if err == nil {
+			return validated, nil
 		}
-		return validated, nil
+		// A conservative byte patch can still prove incomplete when several
+		// mutations interact. Do not let a historical "structural dirty" bit
+		// decide forever whether surgery is usable; validate the actual candidate
+		// and, when it fails, give the scoped structural renderer a chance.
+		surgicalValidationErr = err
 	}
 
-	if patched, ok := structuralRewrite(original, ordered, origOrdered, boundsIdx, unsafePaths, opaquePaths, indent, delSet, rootMappingEmpty); ok {
-		return validateEditedOutput(patched)
+	if patched, ok := structuralRewrite(original, ordered, origOrdered, liveRootSnapshot, boundsIdx, unsafePaths, opaquePaths, indent, delSet, forceScalarRewrite, nodeRewriteTargets, rootMappingEmpty); ok {
+		return validateEditedOutputWithNodeIntents(patched, nodeRewriteTargets, semanticExpected)
+	}
+	if surgicalValidationErr != nil {
+		return nil, surgicalValidationErr
 	}
 
 	return nil, fmt.Errorf("yamledit: surgical edit unsupported; no safe structural rewrite")
 }
 
-func validateEditedOutput(out []byte) ([]byte, error) {
+func validateEditedOutput(out []byte, expected ...gyaml.MapSlice) ([]byte, error) {
+	return validateEditedOutputWithNodeIntents(out, nil, expected...)
+}
+
+func validateEditedOutputWithNodeIntents(out []byte, intents map[string]yamlNodeSignature, expected ...gyaml.MapSlice) ([]byte, error) {
 	var doc yaml.Node
 	if err := decodeSingleYAMLDocument(out, &doc); err != nil {
 		return nil, fmt.Errorf("yamledit: edit would produce invalid YAML: %w", err)
@@ -187,11 +266,74 @@ func validateEditedOutput(out []byte) ([]byte, error) {
 	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("yamledit: edit would change the document root from a mapping")
 	}
+	if len(expected) > 0 {
+		actual, err := yamlNodeToOrderedValue(doc.Content[0])
+		if err != nil {
+			return nil, fmt.Errorf("yamledit: cannot verify edited YAML semantics: %w", err)
+		}
+		actualMap, ok := actual.(gyaml.MapSlice)
+		if !ok || !logicalEqualOrdered(expected[0], actualMap) {
+			return nil, fmt.Errorf("yamledit: edit would not preserve the requested YAML values and types")
+		}
+	}
+	for encoded, want := range intents {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok {
+			return nil, fmt.Errorf("yamledit: cannot verify requested YAML tag at an invalid internal path")
+		}
+		actual, exists := yamlNodeAtPathSegments(doc.Content[0], segments)
+		if !exists || !sameYAMLNodeSignature(signatureOfYAMLNode(actual), want) {
+			got := signatureOfYAMLNode(actual)
+			return nil, fmt.Errorf("yamledit: edit would not preserve the requested YAML kind/tag at path %q (want kind %d tag %q, got kind %d tag %q)", strings.Join(segments, "/"), want.kind, want.tag, got.kind, got.tag)
+		}
+	}
 	return out, nil
 }
 
+// yamlNodeGraphEqual compares the complete serializable YAML graph. Source
+// positions are intentionally excluded: edits do not need to preserve parser
+// coordinates, while every presentation field and alias edge is significant.
+func yamlNodeGraphEqual(a, b *yaml.Node) bool {
+	type nodePair struct {
+		a *yaml.Node
+		b *yaml.Node
+	}
+	seen := make(map[nodePair]struct{})
+	var equal func(*yaml.Node, *yaml.Node) bool
+	equal = func(left, right *yaml.Node) bool {
+		if left == nil || right == nil {
+			return left == right
+		}
+		pair := nodePair{a: left, b: right}
+		if _, ok := seen[pair]; ok {
+			return true
+		}
+		seen[pair] = struct{}{}
+		if left.Kind != right.Kind || left.Style != right.Style || left.Tag != right.Tag ||
+			left.Value != right.Value || left.Anchor != right.Anchor ||
+			left.HeadComment != right.HeadComment || left.LineComment != right.LineComment ||
+			left.FootComment != right.FootComment || len(left.Content) != len(right.Content) {
+			return false
+		}
+		if (left.Alias == nil) != (right.Alias == nil) {
+			return false
+		}
+		if left.Alias != nil && !equal(left.Alias, right.Alias) {
+			return false
+		}
+		for i := range left.Content {
+			if !equal(left.Content[i], right.Content[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return equal(a, b)
+}
+
 // standardEncode performs a standard YAML encoding without surgical editing.
-// Used as fallback when original content is empty or surgical editing fails.
+// It is used for new documents and direct yaml.Node mutations; package-managed
+// edits do not fall back globally when scoped editing is unsafe.
 func standardEncode(doc *yaml.Node, indent int) ([]byte, error) {
 	if indent <= 0 {
 		indent = 2
@@ -209,7 +351,7 @@ func standardEncode(doc *yaml.Node, indent int) ([]byte, error) {
 }
 
 // structuralRewrite surgically re-encodes individual key regions using boundsIdx.
-func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, boundsIdx map[string][]kvBounds, unsafePaths, opaquePaths map[string]struct{}, baseIndent int, delSet map[string]struct{}, rootMappingEmpty bool) ([]byte, bool) {
+func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, liveRoot *yaml.Node, boundsIdx map[string][]kvBounds, unsafePaths, opaquePaths map[string]struct{}, baseIndent int, delSet, forceScalarRewrite map[string]struct{}, nodeRewriteTargets map[string]yamlNodeSignature, rootMappingEmpty bool) ([]byte, bool) {
 	if rootMappingEmpty && len(ordered) == 0 && len(origOrdered) > 0 {
 		for pk := range unsafePaths {
 			if parts, ok := splitJoinedPath(pk); ok && len(parts) == 1 {
@@ -250,6 +392,36 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 	var patches []patch
 	patched := map[string]struct{}{}
 	changed := collectChangedKeysDeep(origOrdered, ordered, nil)
+	for pk := range forceScalarRewrite {
+		changed = append(changed, pk)
+	}
+	// A sequence item has no independent mapping-entry byte range. When an exact
+	// tag replacement occurs there, render the nearest bounded ancestor from the
+	// final live AST. This retains all untouched YAML-only metadata in that scoped
+	// subtree, unlike the ordered JSON-shaped shadow.
+	liveRewritePaths := make(map[string]struct{})
+	for encoded := range nodeRewriteTargets {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok {
+			return nil, false
+		}
+		for depth := len(segments); depth >= 1; depth-- {
+			ancestor := joinPath(segments[:depth])
+			if len(boundsIdx[ancestor]) == 0 {
+				continue
+			}
+			if depth == len(segments) {
+				if _, unsafe := unsafePaths[ancestor]; !unsafe {
+					if _, opaque := opaquePaths[ancestor]; !opaque {
+						break
+					}
+				}
+			}
+			liveRewritePaths[ancestor] = struct{}{}
+			changed = append(changed, ancestor)
+			break
+		}
+	}
 	findSafeContainerAncestor := func(pk string) (string, bool) {
 		parts, ok := splitJoinedPath(pk)
 		if !ok {
@@ -257,6 +429,9 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		}
 		for i := len(parts) - 1; i >= 1; i-- {
 			ancestor := joinPath(parts[:i])
+			if _, live := liveRewritePaths[ancestor]; live {
+				return ancestor, true
+			}
 			_, opaque := opaquePaths[ancestor]
 			if _, unsafe := unsafePaths[ancestor]; unsafe || opaque || len(boundsIdx[ancestor]) == 0 {
 				continue
@@ -309,6 +484,11 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 	for _, pk := range changed {
 		changedSet[pk] = struct{}{}
 	}
+	sort.SliceStable(changed, func(i, j int) bool {
+		left, _ := splitJoinedPath(changed[i])
+		right, _ := splitJoinedPath(changed[j])
+		return len(left) < len(right)
+	})
 	hasChangedSafeAncestor := func(pk string) bool {
 		parts, ok := splitJoinedPath(pk)
 		if !ok {
@@ -381,7 +561,7 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		rewritten[pk] = struct{}{}
 	}
 
-	// Structural fallback must honor last-wins duplicate semantics too.
+	// Scoped structural rewrite must honor last-wins duplicate semantics too.
 	// Keep only widest ranges so a duplicate parent removal subsumes any
 	// duplicate children inside the same block without overlapping patches.
 	var duplicateRanges []kvBounds
@@ -421,7 +601,8 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		if _, skip := patched[pk]; skip {
 			continue
 		}
-		if _, unsafe := unsafePaths[pk]; unsafe {
+		_, liveRewrite := liveRewritePaths[pk]
+		if _, unsafe := unsafePaths[pk]; unsafe && !liveRewrite {
 			if hasRewrittenAncestor(pk) || hasChangedSafeAncestor(pk) {
 				continue
 			}
@@ -440,6 +621,19 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		}
 
 		path, key := splitPathKey(pk)
+		if liveRewrite {
+			b := bounds[len(bounds)-1]
+			txt, ok := renderLiveMappingEntry(original, liveRoot, append(path, key), b, baseIndent)
+			if !ok {
+				return nil, false
+			}
+			if !bytes.Equal(original[b.start:b.end], []byte(txt)) {
+				patches = append(patches, patch{start: b.start, end: b.end, data: []byte(txt)})
+			}
+			patched[pk] = struct{}{}
+			rewritten[pk] = struct{}{}
+			continue
+		}
 		val, ok := orderedValueAt(ordered, path, key)
 		if !ok {
 			// A complex add/replace can remove members without going through
@@ -456,7 +650,14 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		}
 		b := bounds[len(bounds)-1]
 		if isSequence(val) {
-			seqText, okSeq := renderSequenceValue(original, key, val, b, baseIndent)
+			var seqText string
+			var okSeq bool
+			if hasNodeRewriteTargetAtOrBelow(nodeRewriteTargets, append(path, key)) {
+				seqText, okSeq = renderKeyValue(original, key, val, b, baseIndent, append(path, key), nodeRewriteTargets)
+			} else {
+				target, overrideTag := nodeRewriteTargets[pk]
+				seqText, okSeq = renderSequenceValue(original, key, val, b, baseIndent, target, overrideTag)
+			}
 			if !okSeq {
 				return nil, false
 			}
@@ -468,7 +669,7 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 			continue
 		}
 
-		txt, ok := renderKeyValue(original, key, val, b, baseIndent)
+		txt, ok := renderKeyValue(original, key, val, b, baseIndent, append(path, key), nodeRewriteTargets)
 		if !ok {
 			continue
 		}
@@ -650,7 +851,121 @@ func orderedValueAt(ms gyaml.MapSlice, path []string, key string) (interface{}, 
 	}
 }
 
-func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, baseIndent int) (string, bool) {
+func orderedValueAtSegments(ms gyaml.MapSlice, segments []string) (interface{}, bool) {
+	var current interface{} = ms
+	for _, segment := range segments {
+		switch value := current.(type) {
+		case gyaml.MapSlice:
+			var found bool
+			for i := len(value) - 1; i >= 0; i-- {
+				if keyEquals(value[i].Key, segment) {
+					current = value[i].Value
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, false
+			}
+		case []interface{}:
+			if !isIndexPathSegment(segment) {
+				return nil, false
+			}
+			index, err := strconv.Atoi(segment[1 : len(segment)-1])
+			if err != nil || index < 0 || index >= len(value) {
+				return nil, false
+			}
+			current = value[index]
+		default:
+			return nil, false
+		}
+	}
+	return current, true
+}
+
+func hasNodeRewriteTargetAtOrBelow(targets map[string]yamlNodeSignature, path []string) bool {
+	for encoded := range targets {
+		segments, ok := splitJoinedPath(encoded)
+		if ok && len(segments) >= len(path) && pathSegmentsEqual(segments[:len(path)], path) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyNodeRewriteTargets(valueNode *yaml.Node, valuePath []string, targets map[string]yamlNodeSignature) bool {
+	for encoded, target := range targets {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok || len(segments) < len(valuePath) || !pathSegmentsEqual(segments[:len(valuePath)], valuePath) {
+			continue
+		}
+		node, exists := yamlNodeAtPathSegments(valueNode, segments[len(valuePath):])
+		if !exists || node.Kind != target.kind {
+			return false
+		}
+		node.Tag = target.tag
+		if target.kind == yaml.ScalarNode && target.tag != "" {
+			node.Style &^= yaml.TaggedStyle
+		}
+	}
+	return true
+}
+
+func renderLiveMappingEntry(original []byte, liveRoot *yaml.Node, path []string, b kvBounds, baseIndent int) (string, bool) {
+	if liveRoot == nil || len(path) == 0 {
+		return "", false
+	}
+	parent, exists := yamlNodeAtPathSegments(liveRoot, path[:len(path)-1])
+	if !exists || parent.Kind != yaml.MappingNode {
+		return "", false
+	}
+	keyName := path[len(path)-1]
+	var keyNode, valueNode *yaml.Node
+	for index := len(parent.Content) - 2; index >= 0; index -= 2 {
+		if isStringMappingKey(parent.Content[index], keyName) {
+			keyNode, valueNode = parent.Content[index], parent.Content[index+1]
+			break
+		}
+	}
+	if keyNode == nil || valueNode == nil {
+		return "", false
+	}
+
+	entry := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{keyNode, valueNode}}
+	entry = cloneYAMLNodeGraph(entry)
+	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{entry}}
+	lines, ok := encodeNodeLines(doc, baseIndent)
+	if !ok || len(lines) == 0 {
+		return "", false
+	}
+
+	indentSpaces := currentIndent(original, b.start)
+	inlineSequenceKey := false
+	lineEnd := findLineEnd(original, b.start)
+	if lineEnd >= b.start && b.start < len(original) {
+		line := original[b.start:min(lineEnd+1, len(original))]
+		first := leadingSpaces(line)
+		inlineSequenceKey = first+1 < len(line) && line[first] == '-' && (line[first+1] == ' ' || line[first+1] == '\t')
+	}
+	for index := range lines {
+		prefix := strings.Repeat(" ", indentSpaces)
+		if inlineSequenceKey {
+			if index == 0 {
+				prefix += "- "
+			} else {
+				prefix = strings.Repeat(" ", indentSpaces+2)
+			}
+		}
+		lines[index] = prefix + lines[index]
+	}
+	output := strings.Join(lines, "\n")
+	if b.end > b.start && b.end <= len(original) && original[b.end-1] == '\n' {
+		output += "\n"
+	}
+	return output, true
+}
+
+func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, baseIndent int, valuePath []string, nodeRewriteTargets map[string]yamlNodeSignature) (string, bool) {
 	// IMPORTANT: do NOT convert to map[string]interface{} (it loses key order).
 	// Build a yaml.Node mapping and encode that (preserves gyaml.MapSlice order).
 	root := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
@@ -658,6 +973,9 @@ func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, ba
 	valueNode.Anchor = b.anchor
 	if b.collectionTag != "" && (valueNode.Kind == yaml.MappingNode || valueNode.Kind == yaml.SequenceNode) {
 		valueNode.Tag = b.collectionTag
+	}
+	if !applyNodeRewriteTargets(valueNode, valuePath, nodeRewriteTargets) {
+		return "", false
 	}
 	root.Content = append(root.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
@@ -965,7 +1283,7 @@ func isSequence(v interface{}) bool {
 	}
 }
 
-func renderSequenceValue(original []byte, key string, val interface{}, b kvBounds, baseIndent int) (string, bool) {
+func renderSequenceValue(original []byte, key string, val interface{}, b kvBounds, baseIndent int, target yamlNodeSignature, overrideTag bool) (string, bool) {
 	arr, ok := val.([]interface{})
 	if !ok {
 		return "", false
@@ -976,11 +1294,19 @@ func renderSequenceValue(original []byte, key string, val interface{}, b kvBound
 	var sb strings.Builder
 	sb.WriteString(strings.Repeat(" ", indentSpaces))
 	sb.WriteString(renderMappingKey(key))
+	collectionTag := b.collectionTag
+	if overrideTag && target.exists && target.kind == yaml.SequenceNode {
+		if target.tag == "!!seq" {
+			collectionTag = ""
+		} else {
+			collectionTag = target.tag
+		}
+	}
 	if len(arr) == 0 {
 		sb.WriteString(":")
-		if b.collectionTag != "" {
+		if collectionTag != "" {
 			sb.WriteString(" ")
-			sb.WriteString(renderYAMLTagProperty(b.collectionTag))
+			sb.WriteString(renderYAMLTagProperty(collectionTag))
 		}
 		if b.anchor != "" {
 			sb.WriteString(" &")
@@ -997,9 +1323,9 @@ func renderSequenceValue(original []byte, key string, val interface{}, b kvBound
 		return sb.String(), true
 	}
 	sb.WriteString(":")
-	if b.collectionTag != "" {
+	if collectionTag != "" {
 		sb.WriteString(" ")
-		sb.WriteString(renderYAMLTagProperty(b.collectionTag))
+		sb.WriteString(renderYAMLTagProperty(collectionTag))
 	}
 	if b.anchor != "" {
 		sb.WriteString(" &")

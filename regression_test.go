@@ -384,7 +384,12 @@ func TestJSONPatchPreservesExactJSONNumbersAndTestsByNumericValue(t *testing.T) 
 	out, err := Marshal(doc)
 	require.NoError(t, err)
 	require.Contains(t, string(out), "precise: 9007199254740993.0")
-	require.Contains(t, string(out), "large: 1e999")
+	require.Contains(t, string(out), "large: !!float 1e999")
+	var round yaml.Node
+	require.NoError(t, yaml.Unmarshal(out, &round), "output:\n%s", out)
+	large := scalarForKey(t, out, "large")
+	require.Equal(t, "!!float", large.Tag, "output:\n%s", out)
+	require.Equal(t, "1e999", large.Value)
 }
 
 func TestJSONPatchCopyDereferencesOrdinaryAlias(t *testing.T) {
@@ -1436,12 +1441,22 @@ func TestUnsafePromotionDoesNotDropUntouchedMetadata(t *testing.T) {
 		require.Error(t, err, "input:\n%s", input)
 	}
 
-	t.Run("typed key in rewritten item", func(t *testing.T) {
+	t.Run("typed key survives indexed insertion", func(t *testing.T) {
 		doc, err := Parse([]byte("items:\n  - 1: integer\n"))
 		require.NoError(t, err)
 		require.NoError(t, ApplyJSONPatchBytes(doc, []byte(`[{"op":"add","path":"/items/0/new","value":"x"}]`)))
-		_, err = Marshal(doc)
-		require.Error(t, err)
+		out, err := Marshal(doc)
+		require.NoError(t, err)
+		var reparsed yaml.Node
+		require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
+		item := reparsed.Content[0].Content[1].Content[0]
+		require.Equal(t, yaml.MappingNode, item.Kind, "output:\n%s", out)
+		require.Len(t, item.Content, 4, "output:\n%s", out)
+		require.Equal(t, "!!int", item.Content[0].Tag, "output:\n%s", out)
+		require.Equal(t, "1", item.Content[0].Value, "output:\n%s", out)
+		require.Equal(t, "integer", item.Content[1].Value, "output:\n%s", out)
+		require.Equal(t, "new", item.Content[2].Value, "output:\n%s", out)
+		require.Equal(t, "x", item.Content[3].Value, "output:\n%s", out)
 	})
 
 	t.Run("untouched comment and block style", func(t *testing.T) {

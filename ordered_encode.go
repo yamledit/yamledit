@@ -40,11 +40,20 @@ func orderedToYAMLNode(v interface{}) *yaml.Node {
 	case float64:
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: formatYAMLFloat(t)}
 	case json.Number:
+		if !isValidJSONNumber(t) {
+			// json.Number is publicly constructible and may contain arbitrary text.
+			// Preserve that text as data instead of treating it as trusted YAML syntax.
+			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: string(t)}
+		}
 		tag := "!!int"
 		if strings.ContainsAny(string(t), ".eE") {
 			tag = "!!float"
 		}
-		return &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: string(t)}
+		node := &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: string(t)}
+		if !yamlLexemeResolvesAsTag(string(t), tag) {
+			node.Style |= yaml.TaggedStyle
+		}
+		return node
 	case string:
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: t}
 

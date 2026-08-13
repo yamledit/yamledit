@@ -92,7 +92,7 @@ func walkBoundsDeep(original []byte, lineOffsets []int, node *yaml.Node, prefix 
 			if explicitKey || dashOwned || nonStringKey {
 				unsafe[pk] = struct{}{}
 			} else if !flowContext {
-				b, ok := boundsForMappingEntry(original, lineOffsets, k)
+				b, ok := boundsForMappingEntry(original, lineOffsets, k, v)
 				if ok {
 					b.anchor = v.Anchor
 					if (v.Kind == yaml.MappingNode && v.Tag != "!!map") || (v.Kind == yaml.SequenceNode && v.Tag != "!!seq") {
@@ -293,7 +293,7 @@ func mappingKeyOwnsSequenceDash(original []byte, lineOffsets []int, keyNode *yam
 //
 // This is what lets structuralRewrite replace ONLY "…/properties/groupId" rather than the whole
 // "pipelineProcess" block.
-func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode *yaml.Node) (kvBounds, bool) {
+func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode, valueNode *yaml.Node) (kvBounds, bool) {
 	if keyNode == nil || keyNode.Line <= 0 {
 		return kvBounds{}, false
 	}
@@ -306,6 +306,24 @@ func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode *yaml.Nod
 		start = 3
 	}
 	keyIndent := keyNode.Column - 1 // important for "- key: ..." cases
+	// normalizeImplicitMaps represents a bare `key:` as an empty block-style
+	// mapping. It has no source subtree of its own, so an indented standalone
+	// comment after the key must not be swallowed when the bare token is rewritten
+	// to `{}`. yaml.v3 commonly attaches that comment to the following key.
+	implicitEmptyMap := valueNode != nil && valueNode.Kind == yaml.MappingNode &&
+		len(valueNode.Content) == 0 && valueNode.Style&yaml.FlowStyle == 0
+	// Indentation normally identifies the next sibling, but YAML permits quoted
+	// scalars and flow collections to continue at any column. A continuation such
+	// as the second line below is still part of `value`, even though it begins at
+	// the same indentation as a top-level key:
+	//
+	//   value: "first
+	//   looks: like-a-key"
+	//
+	// The same applies to `{ ... }` / `[ ... ]`, including those nested inside a
+	// block sequence. Never terminate a key region before every explicitly
+	// delimited token in its value subtree has closed.
+	mandatoryEnd := sourceDelimitedSubtreeEnd(original, lineOffsets, valueNode)
 
 	end := len(original)
 	for ln := keyNode.Line + 1; ln <= len(lineOffsets); ln++ {
@@ -315,6 +333,9 @@ func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode *yaml.Nod
 			lineEnd = lineOffsets[ln] // start of next line
 		}
 		raw := original[lineStart:lineEnd]
+		if lineStart < mandatoryEnd {
+			continue
+		}
 
 		trim := bytes.TrimSpace(raw)
 		if len(trim) == 0 {
@@ -324,7 +345,7 @@ func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode *yaml.Nod
 			// A same/less-indented standalone comment is safer to associate with
 			// the following sibling (or document footer), not the key being
 			// deleted. More-indented comments remain inside this key's subtree.
-			if countLeadingIndent(raw) <= keyIndent {
+			if implicitEmptyMap || countLeadingIndent(raw) <= keyIndent {
 				end = lineStart
 				break
 			}
@@ -348,6 +369,224 @@ func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode *yaml.Nod
 	}
 
 	return kvBounds{start: start, end: end}, true
+}
+
+// sourceDelimitedSubtreeEnd returns the furthest exclusive byte offset occupied
+// by a source token whose closing boundary cannot be inferred from indentation:
+// quoted scalars, flow collections, and block scalars. A block mapping/sequence
+// may contain one of these values, so inspect the whole subtree. The returned
+// offset is a lower bound only; boundsForMappingEntry still uses indentation to
+// include ordinary block children and to stop before the next sibling.
+func sourceDelimitedSubtreeEnd(original []byte, lineOffsets []int, root *yaml.Node) int {
+	maxEnd := 0
+	seen := make(map[*yaml.Node]struct{})
+	var walk func(*yaml.Node)
+	walk = func(node *yaml.Node) {
+		if node == nil {
+			return
+		}
+		if _, ok := seen[node]; ok {
+			return
+		}
+		seen[node] = struct{}{}
+		if end, ok := sourceDelimitedNodeEnd(original, lineOffsets, node); ok && end > maxEnd {
+			maxEnd = end
+		}
+		for _, child := range node.Content {
+			walk(child)
+		}
+	}
+	walk(root)
+	return maxEnd
+}
+
+func sourceDelimitedNodeEnd(original []byte, lineOffsets []int, node *yaml.Node) (int, bool) {
+	if node == nil || len(original) == 0 {
+		return 0, false
+	}
+	pos := offsetFor(original, lineOffsets, node.Line, node.Column)
+	if pos < 0 || pos >= len(original) {
+		return 0, false
+	}
+	pos = skipYAMLNodeProperties(original, pos)
+	if pos < 0 || pos >= len(original) {
+		return 0, false
+	}
+
+	if node.Kind == yaml.ScalarNode {
+		switch {
+		case node.Style&yaml.SingleQuotedStyle != 0 && original[pos] == '\'':
+			return scanYAMLSingleQuotedEnd(original, pos)
+		case node.Style&yaml.DoubleQuotedStyle != 0 && original[pos] == '"':
+			return scanYAMLDoubleQuotedEnd(original, pos)
+		case node.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0:
+			lineStart := lineStartOffset(lineOffsets, node.Line)
+			lineEnd := findLineEnd(original, lineStart)
+			if lineStart < 0 || lineStart >= len(original) || lineEnd < lineStart {
+				return 0, false
+			}
+			keyIndent := countLeadingIndent(original[lineStart:min(lineEnd+1, len(original))])
+			end := extendScalarBlockEnd(original, lineOffsets, node.Line, keyIndent)
+			if end >= 0 && end < len(original) {
+				return end + 1, true
+			}
+		}
+		return 0, false
+	}
+
+	if node.Style&yaml.FlowStyle == 0 || (node.Kind != yaml.MappingNode && node.Kind != yaml.SequenceNode) {
+		return 0, false
+	}
+	want := byte('{')
+	if node.Kind == yaml.SequenceNode {
+		want = '['
+	}
+	if original[pos] != want {
+		return 0, false
+	}
+	return scanYAMLFlowCollectionEnd(original, pos)
+}
+
+// yaml.v3 reports a node's column at its first tag/anchor property. Advance to
+// the actual scalar/collection token, allowing properties to be separated by
+// comments and physical lines.
+func skipYAMLNodeProperties(original []byte, pos int) int {
+	for {
+		for pos < len(original) {
+			switch original[pos] {
+			case ' ', '\t', '\r', '\n':
+				pos++
+			case '#':
+				for pos < len(original) && original[pos] != '\n' {
+					pos++
+				}
+			default:
+				goto token
+			}
+		}
+		return pos
+
+	token:
+		if original[pos] != '&' && original[pos] != '!' {
+			return pos
+		}
+		if original[pos] == '!' && pos+1 < len(original) && original[pos+1] == '<' {
+			close := bytes.IndexByte(original[pos+2:], '>')
+			if close < 0 {
+				return len(original)
+			}
+			pos += close + 3
+			continue
+		}
+		pos++
+		for pos < len(original) {
+			switch original[pos] {
+			case ' ', '\t', '\r', '\n', ',', '[', ']', '{', '}':
+				goto nextProperty
+			default:
+				pos++
+			}
+		}
+		return pos
+	nextProperty:
+	}
+}
+
+func scanYAMLSingleQuotedEnd(original []byte, start int) (int, bool) {
+	for pos := start + 1; pos < len(original); pos++ {
+		if original[pos] != '\'' {
+			continue
+		}
+		if pos+1 < len(original) && original[pos+1] == '\'' {
+			pos++
+			continue
+		}
+		return pos + 1, true
+	}
+	return 0, false
+}
+
+func scanYAMLDoubleQuotedEnd(original []byte, start int) (int, bool) {
+	escaped := false
+	for pos := start + 1; pos < len(original); pos++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch original[pos] {
+		case '\\':
+			escaped = true
+		case '"':
+			return pos + 1, true
+		}
+	}
+	return 0, false
+}
+
+func scanYAMLFlowCollectionEnd(original []byte, start int) (int, bool) {
+	stack := []byte{original[start]}
+	inSingle, inDouble, escaped, inComment := false, false, false, false
+	for pos := start + 1; pos < len(original); pos++ {
+		ch := original[pos]
+		if inComment {
+			if ch == '\n' {
+				inComment = false
+			}
+			continue
+		}
+		if inDouble {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+			} else if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if ch == '\'' {
+				if pos+1 < len(original) && original[pos+1] == '\'' {
+					pos++
+				} else {
+					inSingle = false
+				}
+			}
+			continue
+		}
+
+		switch ch {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '#':
+			if pos == 0 || original[pos-1] == ' ' || original[pos-1] == '\t' || original[pos-1] == '\r' || original[pos-1] == '\n' || original[pos-1] == ',' {
+				inComment = true
+			}
+		case '!':
+			// Delimiters are legal inside a verbatim tag URI and must not affect
+			// collection depth.
+			if pos+1 < len(original) && original[pos+1] == '<' {
+				if close := bytes.IndexByte(original[pos+2:], '>'); close >= 0 {
+					pos += close + 2
+				}
+			}
+		case '{', '[':
+			stack = append(stack, ch)
+		case '}', ']':
+			if len(stack) == 0 || (ch == '}' && stack[len(stack)-1] != '{') || (ch == ']' && stack[len(stack)-1] != '[') {
+				return 0, false
+			}
+			stack = stack[:len(stack)-1]
+			if len(stack) == 0 {
+				return pos + 1, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func countLeadingIndent(line []byte) int {

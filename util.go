@@ -249,9 +249,157 @@ func removalWouldBreakAlias(scanRoot *yaml.Node, targets ...*yaml.Node) bool {
 	return walk(scanRoot)
 }
 
-// validateYAMLAliasGraph verifies that every alias still points to the exact
-// anchored node that remains reachable through the document's content tree.
+// validateYAMLMarshalDocument rejects malformed node graphs before yaml.v3's
+// encoder sees them. The encoder deliberately ignores an unmatched mapping
+// child and dereferences nil children, which would otherwise turn malformed
+// caller-constructed ASTs into silent data loss or a panic.
+//
+// Content edges must form an acyclic graph. Alias edges are intentionally not
+// followed here: a valid recursive YAML value is represented by an Alias node
+// pointing back to an anchored ancestor.
+func validateYAMLMarshalDocument(doc *yaml.Node) error {
+	if doc == nil {
+		return fmt.Errorf("yamledit: live document must contain exactly one YAML root: document is nil")
+	}
+	if doc.Kind != yaml.DocumentNode {
+		return fmt.Errorf("yamledit: live document must contain exactly one YAML root: expected a DocumentNode")
+	}
+	if len(doc.Content) != 1 || doc.Content[0] == nil {
+		return fmt.Errorf("yamledit: live document must contain exactly one YAML root")
+	}
+	if doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("yamledit: live document root is not a mapping")
+	}
+
+	const (
+		visiting = 1
+		visited  = 2
+	)
+	state := make(map[*yaml.Node]uint8)
+	var walk func(*yaml.Node, bool) error
+	walk = func(node *yaml.Node, rootDocument bool) error {
+		if node == nil {
+			return fmt.Errorf("yamledit: malformed YAML node graph contains a nil child")
+		}
+		switch state[node] {
+		case visiting:
+			return fmt.Errorf("yamledit: YAML Content graph contains a cycle")
+		case visited:
+			return nil
+		}
+		state[node] = visiting
+		defer func() { state[node] = visited }()
+
+		textFields := []struct {
+			name  string
+			value string
+		}{
+			{name: "tag", value: node.Tag},
+			{name: "value", value: node.Value},
+			{name: "anchor", value: node.Anchor},
+			{name: "head comment", value: node.HeadComment},
+			{name: "line comment", value: node.LineComment},
+			{name: "foot comment", value: node.FootComment},
+		}
+		for _, field := range textFields {
+			if !utf8.ValidString(field.value) {
+				return fmt.Errorf("yamledit: YAML node %s contains invalid UTF-8", field.name)
+			}
+		}
+
+		if node.Kind != yaml.AliasNode && node.Alias != nil {
+			return fmt.Errorf("yamledit: malformed YAML node kind %d has an alias target", node.Kind)
+		}
+		switch node.Kind {
+		case yaml.DocumentNode:
+			if !rootDocument || len(node.Content) != 1 || node.Content[0] == nil {
+				return fmt.Errorf("yamledit: malformed YAML document node")
+			}
+			if node.Tag != "" || node.Value != "" || node.Anchor != "" || node.Style != 0 || node.LineComment != "" {
+				return fmt.Errorf("yamledit: malformed YAML document node has fields the encoder cannot represent")
+			}
+		case yaml.MappingNode:
+			if len(node.Content)%2 != 0 {
+				return fmt.Errorf("yamledit: malformed YAML mapping node has an unmatched key or value")
+			}
+			if node.Value != "" || node.Style&^(yaml.TaggedStyle|yaml.FlowStyle) != 0 {
+				return fmt.Errorf("yamledit: malformed YAML mapping node has fields the encoder cannot represent")
+			}
+			for index, child := range node.Content {
+				if child == nil {
+					return fmt.Errorf("yamledit: malformed YAML mapping node has a nil child at index %d", index)
+				}
+			}
+		case yaml.SequenceNode:
+			if node.Value != "" || node.Style&^(yaml.TaggedStyle|yaml.FlowStyle) != 0 {
+				return fmt.Errorf("yamledit: malformed YAML sequence node has fields the encoder cannot represent")
+			}
+			for index, child := range node.Content {
+				if child == nil {
+					return fmt.Errorf("yamledit: malformed YAML sequence node has a nil child at index %d", index)
+				}
+			}
+		case yaml.ScalarNode:
+			if len(node.Content) != 0 {
+				return fmt.Errorf("yamledit: malformed YAML scalar node has content children")
+			}
+			allowed := yaml.TaggedStyle | yaml.DoubleQuotedStyle | yaml.SingleQuotedStyle | yaml.LiteralStyle | yaml.FoldedStyle
+			if node.Style&^allowed != 0 {
+				return fmt.Errorf("yamledit: malformed YAML scalar node has a style the encoder cannot represent")
+			}
+			presentation := node.Style & (yaml.DoubleQuotedStyle | yaml.SingleQuotedStyle | yaml.LiteralStyle | yaml.FoldedStyle)
+			if presentation != 0 && presentation&(presentation-1) != 0 {
+				return fmt.Errorf("yamledit: malformed YAML scalar node requests conflicting styles")
+			}
+		case yaml.AliasNode:
+			if len(node.Content) != 0 {
+				return fmt.Errorf("yamledit: malformed YAML alias node has content children")
+			}
+			if node.Tag != "" || node.Anchor != "" || node.Style != 0 {
+				return fmt.Errorf("yamledit: malformed YAML alias node has fields the encoder cannot represent")
+			}
+		case 0:
+			// yaml.v3 explicitly treats a completely zero Node as a null value.
+			if !node.IsZero() {
+				return fmt.Errorf("yamledit: malformed zero-kind YAML node")
+			}
+		default:
+			return fmt.Errorf("yamledit: cannot encode YAML node with unknown kind %d", node.Kind)
+		}
+
+		for _, child := range node.Content {
+			if err := walk(child, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(doc, true); err != nil {
+		return err
+	}
+	return validateYAMLAliasGraph(doc)
+}
+
+// validateYAMLContentTree applies the marshal validator to a standalone mapping
+// handle. JSON Patch accepts these in addition to complete documents.
+func validateYAMLContentTree(root *yaml.Node) error {
+	if root == nil || root.Kind != yaml.MappingNode {
+		return fmt.Errorf("yamledit: ApplyJSONPatch requires a DocumentNode or MappingNode")
+	}
+	doc := &yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
+	return validateYAMLMarshalDocument(doc)
+}
+
+// validateYAMLAliasGraph verifies both pointer reachability and the meaning of
+// the serialized alias name. YAML aliases do not encode a target pointer; an
+// emitted *name resolves to the most recently emitted &name anchor. Checking
+// that order prevents a direct AST retarget from being silently lost when a
+// document contains duplicate anchor names.
 func validateYAMLAliasGraph(root *yaml.Node) error {
+	if root == nil {
+		return fmt.Errorf("yamledit: invalid YAML alias graph has no root")
+	}
+
 	reachable := make(map[*yaml.Node]struct{})
 	var collect func(*yaml.Node)
 	collect = func(node *yaml.Node) {
@@ -268,21 +416,60 @@ func validateYAMLAliasGraph(root *yaml.Node) error {
 	}
 	collect(root)
 
-	for node := range reachable {
-		if node.Kind != yaml.AliasNode {
-			continue
+	anchors := make(map[string]*yaml.Node)
+	active := make(map[*yaml.Node]bool)
+	budget := orderedShadowNodeBudget
+	var walk func(*yaml.Node) error
+	walk = func(node *yaml.Node) error {
+		if node == nil {
+			return fmt.Errorf("yamledit: invalid YAML alias graph contains a nil node")
 		}
-		if node.Alias == nil {
-			return fmt.Errorf("yamledit: invalid YAML alias %q has no target", node.Value)
+		if budget <= 0 {
+			return fmt.Errorf("yamledit: YAML alias graph traversal exceeds %d nodes", orderedShadowNodeBudget)
 		}
-		if _, ok := reachable[node.Alias]; !ok {
-			return fmt.Errorf("yamledit: invalid YAML alias %q refers to a removed anchor", node.Value)
+		budget--
+		if active[node] {
+			return fmt.Errorf("yamledit: YAML Content graph contains a cycle")
 		}
-		if node.Alias.Anchor == "" || (node.Value != "" && node.Alias.Anchor != node.Value) {
-			return fmt.Errorf("yamledit: invalid YAML alias %q no longer matches its anchor", node.Value)
+		active[node] = true
+		defer delete(active, node)
+
+		if node.Kind == yaml.AliasNode {
+			if node.Value == "" {
+				return fmt.Errorf("yamledit: invalid YAML alias has an empty name")
+			}
+			if node.Alias == nil {
+				return fmt.Errorf("yamledit: invalid YAML alias %q has no target", node.Value)
+			}
+			if _, ok := reachable[node.Alias]; !ok {
+				return fmt.Errorf("yamledit: invalid YAML alias %q refers to a removed anchor", node.Value)
+			}
+			if node.Alias.Kind == yaml.AliasNode || node.Alias.Anchor == "" || node.Alias.Anchor != node.Value {
+				return fmt.Errorf("yamledit: invalid YAML alias %q no longer matches its anchor", node.Value)
+			}
+			selected, exists := anchors[node.Value]
+			if !exists {
+				return fmt.Errorf("yamledit: invalid YAML alias %q has no preceding anchor", node.Value)
+			}
+			if selected != node.Alias {
+				return fmt.Errorf("yamledit: invalid YAML alias %q points to an anchor that its serialized name would not select", node.Value)
+			}
+			return nil
 		}
+
+		// An anchor is emitted on a collection start or scalar event before any
+		// descendants, so recursive aliases inside an anchored collection work.
+		if node.Anchor != "" {
+			anchors[node.Anchor] = node
+		}
+		for _, child := range node.Content {
+			if err := walk(child); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
-	return nil
+	return walk(root)
 }
 
 func cloneMapIndex(in map[string]*mapInfo) map[string]*mapInfo {
@@ -530,6 +717,9 @@ func scalarYAMLTag(v interface{}) (string, bool) {
 	case float32, float64:
 		return "!!float", true
 	case json.Number:
+		if !isValidJSONNumber(value) {
+			return "!!str", true
+		}
 		if strings.ContainsAny(string(value), ".eE") {
 			return "!!float", true
 		}
@@ -539,6 +729,26 @@ func scalarYAMLTag(v interface{}) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// isValidJSONNumber reports whether value is exactly one JSON number token.
+// json.Number is a string type and callers can construct arbitrary values, so
+// neither its type nor its String method is evidence that emitting it verbatim
+// is safe. Requiring the decoder to return the identical token also rejects
+// otherwise-valid JSON surrounded by whitespace.
+func isValidJSONNumber(value json.Number) bool {
+	raw := string(value)
+	if raw == "" || !json.Valid([]byte(raw)) {
+		return false
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var decoded interface{}
+	if err := dec.Decode(&decoded); err != nil {
+		return false
+	}
+	number, ok := decoded.(json.Number)
+	return ok && number.String() == raw
 }
 
 func lineStartOffset(lineOffsets []int, line int) int {
@@ -1005,12 +1215,41 @@ func renderScalarToken(v interface{}) (string, bool) {
 	case float64:
 		return formatYAMLFloat(value), true
 	case json.Number:
-		return string(value), true
+		if !isValidJSONNumber(value) {
+			return renderStringToken(string(value)), true
+		}
+		return renderJSONNumberToken(value), true
 	case string:
 		return renderStringToken(value), true
 	default:
 		return "", false
 	}
+}
+
+// YAML 1.2's core schema recognizes ordinary JSON number spellings only while
+// they remain representable by the decoder's numeric resolver. Very large
+// exponents otherwise resolve as strings. Preserve their JSON numeric type with
+// an explicit YAML tag; json.Number values arrive only after strict JSON-number
+// validation, so emitting the lexeme here is safe.
+func renderJSONNumberToken(value json.Number) string {
+	raw := value.String()
+	if strings.ContainsAny(raw, ".eE") && !yamlLexemeResolvesAsTag(raw, "!!float") {
+		return "!!float " + raw
+	}
+	if !strings.ContainsAny(raw, ".eE") && !yamlLexemeResolvesAsTag(raw, "!!int") {
+		return "!!int " + raw
+	}
+	return raw
+}
+
+func yamlLexemeResolvesAsTag(raw, want string) bool {
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte("x: "+raw+"\n"), &node); err != nil ||
+		node.Kind != yaml.DocumentNode || len(node.Content) == 0 ||
+		node.Content[0].Kind != yaml.MappingNode || len(node.Content[0].Content) < 2 {
+		return false
+	}
+	return node.Content[0].Content[1].Tag == want
 }
 
 func isSafeBareString(s string) bool {
@@ -1098,10 +1337,6 @@ func stringReplacementToken(oldTok []byte, newVal string) []byte {
 	if len(oldTok) > 0 && oldTok[0] == '"' {
 		return []byte(`"` + escapeDoubleQuotes(newVal) + `"`)
 	}
-	// If the original token was bare and the value didn't change, keep it as-is.
-	if string(oldTok) == newVal {
-		return append([]byte(nil), oldTok...)
-	}
 	// Bare previously
 	if isSafeBareString(newVal) {
 		return []byte(newVal)
@@ -1154,13 +1389,55 @@ func maxLineEndForNode(st *docState, n *yaml.Node) int {
 		}
 		if n.Line > 0 && n.Column > 0 {
 			vs := scalarValueOffset(st.original, st.lineOffsets, n)
+			if vs < 0 && n.Kind == yaml.ScalarNode && n.Value != "" {
+				// yaml.v3 locates a scalar at its first tag/anchor property. The
+				// byte-surgery offset intentionally refuses to cross a newline, but
+				// whole-item bounds still need the actual token line:
+				//
+				//   - !!str
+				//     plain
+				//
+				// Advance through the properties here so retaining this item cannot
+				// truncate its value during a sequence rewrite.
+				propertyStart := offsetFor(st.original, st.lineOffsets, n.Line, n.Column)
+				if propertyStart >= 0 {
+					if tokenStart := skipYAMLNodeProperties(st.original, propertyStart); tokenStart >= 0 && tokenStart < len(st.original) {
+						vs = tokenStart
+					}
+				}
+			}
 			if vs >= 0 && vs < len(st.original) {
 				le := findLineEnd(st.original, vs)
-				if n.Kind == yaml.ScalarNode && (st.original[vs] == '|' || st.original[vs] == '>') {
+				if n.Kind == yaml.ScalarNode && (n.Style&yaml.SingleQuotedStyle != 0 || n.Style&yaml.DoubleQuotedStyle != 0) {
+					// Quoted scalars may legally continue at column one. Extend to
+					// the physical line containing the actual closing quote.
+					var tokenEnd int
+					var ok bool
+					if n.Style&yaml.SingleQuotedStyle != 0 {
+						tokenEnd, ok = scanYAMLSingleQuotedEnd(st.original, vs)
+					} else {
+						tokenEnd, ok = scanYAMLDoubleQuotedEnd(st.original, vs)
+					}
+					if ok && tokenEnd > 0 {
+						le = findLineEnd(st.original, tokenEnd-1)
+					}
+				} else if n.Kind == yaml.ScalarNode && (st.original[vs] == '|' || st.original[vs] == '>') {
 					lineStart := lineStartOffset(st.lineOffsets, n.Line)
 					lineEnd := findLineEnd(st.original, lineStart)
 					keyIndent := leadingSpaces(st.original[lineStart:min(lineEnd+1, len(st.original))])
 					le = extendScalarBlockEnd(st.original, st.lineOffsets, n.Line, keyIndent)
+				} else if n.Kind == yaml.ScalarNode && (strings.Contains(n.Value, "\n") || strings.Contains(n.Value, " ")) {
+					// Plain continuation lines must remain part of a retained or
+					// replaced sequence item as well. A scalar item starts after
+					// "- ", so its continuation indentation is compared with the
+					// sequence dash indentation, not the scalar's reported column.
+					lineStart := lineStartOffset(st.lineOffsets, n.Line)
+					lineEnd := findLineEnd(st.original, lineStart)
+					containerIndent := leadingSpaces(st.original[lineStart:min(lineEnd+1, len(st.original))])
+					candidate := extendScalarBlockEnd(st.original, st.lineOffsets, n.Line, containerIndent)
+					if candidate > le {
+						le = candidate
+					}
 				}
 				if le > maxEnd {
 					maxEnd = le

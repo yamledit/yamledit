@@ -1,8 +1,9 @@
 package yamledit
 
 import (
+	"encoding/json"
 	"fmt"
-	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ func EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node {
 		st = owner
 		st.mu.Lock()
 		defer st.mu.Unlock()
+		noteDirectASTMutationLocked(st)
 		var err error
 		startMap, baseTokens, err = resolveRegisteredStartLocked(node, st, doc, isDocument)
 		if err != nil {
@@ -74,14 +76,23 @@ func EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node {
 			}
 		}
 
+		segmentChanged := false
+		nextTokens := append(append([]ptrToken(nil), curTokens...), ptrToken{key: k})
 		if found == nil {
+			if st != nil {
+				recordNodeReplacementIntentLocked(st, tokenPathSegments(nextTokens), nil, yamlNodeSignature{kind: yaml.MappingNode, tag: "!!map", exists: true})
+			}
 			key := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k}
 			val := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 			cur.Content = append(cur.Content, key, val)
 			keyNode = key
 			found = val
+			segmentChanged = true
 		}
 		if found.Kind != yaml.MappingNode {
+			if st != nil {
+				recordNodeReplacementIntentLocked(st, tokenPathSegments(nextTokens), found, yamlNodeSignature{kind: yaml.MappingNode, tag: "!!map", exists: true})
+			}
 			// Preserve comments, but keep the old inline comment on the *key* line
 			oldHead, oldLine, oldFoot, oldAnchor := found.HeadComment, found.LineComment, found.FootComment, found.Anchor
 			repl := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
@@ -94,12 +105,20 @@ func EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node {
 				}
 			}
 			*found = *repl
+			segmentChanged = true
 		}
 		cur = found
-		curTokens = append(curTokens, ptrToken{key: k})
+		curTokens = nextTokens
 
 		// Keep handle → path mapping up to date for new/converted nodes
 		if st != nil {
+			if segmentChanged {
+				// A delete marker describes the old subtree at this path. Creating or
+				// replacing that subtree invalidates the marker and every marker below
+				// it. Do not clear markers merely while traversing an existing mapping:
+				// an unrelated child deletion must remain pending.
+				clearDeletionMarkersAtOrBelow(st, tokenPathSegments(curTokens))
+			}
 			if keyPath, ok := mappingOnlyTokenPath(curTokens); ok {
 				st.subPathByHN[weak.Make(cur)] = keyPath
 			}
@@ -110,9 +129,8 @@ func EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node {
 	if st != nil {
 		if updated, err := orderedEnsureMapPath(st.ordered, curTokens); err == nil {
 			st.ordered = updated
-		} else {
-			st.structuralDirty = true
 		}
+		recordExpectedASTLocked(st)
 	}
 
 	return cur
@@ -187,6 +205,43 @@ func orderedEnsureMapPath(ms gyaml.MapSlice, path []ptrToken) (gyaml.MapSlice, e
 	return updated, nil
 }
 
+// recordExpectedASTLocked records the tree state produced by a public mutator.
+// The caller must hold st.mu for writing. Keeping this separate from the ordered
+// shadow lets Marshal distinguish those intentional edits from callers changing
+// yaml.Node fields directly (including comments, tags, styles, and aliases).
+func recordExpectedASTLocked(st *docState) {
+	if st == nil {
+		return
+	}
+	if doc := st.root(); doc != nil {
+		st.expectedAST = cloneYAMLNodeGraph(doc)
+	}
+}
+
+func setForcedScalarIntentLocked(st *docState, path []string, tag string) {
+	if st == nil || len(path) == 0 {
+		return
+	}
+	if st.forceScalarRewrite == nil {
+		st.forceScalarRewrite = make(map[string]struct{})
+	}
+	if st.forceScalarTags == nil {
+		st.forceScalarTags = make(map[string]string)
+	}
+	encoded := joinPath(path)
+	st.forceScalarRewrite[encoded] = struct{}{}
+	st.forceScalarTags[encoded] = tag
+}
+
+func noteDirectASTMutationLocked(st *docState) {
+	if st == nil || st.directASTDirty {
+		return
+	}
+	if doc := st.root(); doc != nil && !yamlNodeGraphEqual(doc, st.expectedAST) {
+		st.directASTDirty = true
+	}
+}
+
 // setScalarNode updates a scalar node while preserving existing comments.
 func setScalarNode(n *yaml.Node, tag, val string) {
 	head, line, foot := n.HeadComment, n.LineComment, n.FootComment
@@ -205,7 +260,15 @@ func upsertScalarKey(mapNode *yaml.Node, key, tag, val string) {
 	for i := 0; i+1 < len(mapNode.Content); i += 2 {
 		k := mapNode.Content[i]
 		if isStringMappingKey(k, key) {
-			setScalarNode(mapNode.Content[i+1], tag, val)
+			if mapNode.Content[i+1] == nil {
+				// Public yaml.Node values are mutable, so callers can hand a setter a
+				// malformed pair with a nil value node. Repair the exact pair instead
+				// of dereferencing nil; other malformed content remains untouched and
+				// will still be rejected by Marshal.
+				mapNode.Content[i+1] = &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: val}
+			} else {
+				setScalarNode(mapNode.Content[i+1], tag, val)
+			}
 			updated = true
 		}
 	}
@@ -223,6 +286,7 @@ func setScalarValue(
 	key string,
 	tag string,
 	val string,
+	logicalValue any,
 	updateOrdered func(ms gyaml.MapSlice, path []string, key string) gyaml.MapSlice,
 ) {
 	if mapNode == nil {
@@ -230,17 +294,21 @@ func setScalarValue(
 	}
 
 	st, docHN, isDocument, registered := findRegisteredNodeOwner(mapNode)
+	var mapPathTokens []ptrToken
 	if registered {
 		if isDocument {
 			return
 		}
 		st.mu.Lock()
 		defer st.mu.Unlock()
+		noteDirectASTMutationLocked(st)
 		root := st.root()
 		if root == nil || root != docHN || len(root.Content) == 0 {
 			return
 		}
-		if _, reachable := addressableTokenPathToNode(root.Content[0], mapNode); !reachable || mapNode.Kind != yaml.MappingNode {
+		var reachable bool
+		mapPathTokens, reachable = addressableTokenPathToNode(root.Content[0], mapNode)
+		if !reachable || mapNode.Kind != yaml.MappingNode {
 			return
 		}
 	} else {
@@ -254,12 +322,20 @@ func setScalarValue(
 		return
 	}
 
-	existed := false
-	for i := 0; i+1 < len(mapNode.Content); i += 2 {
+	forceRewrite := false
+	var oldNode *yaml.Node
+	for i := len(mapNode.Content) - 2; i >= 0; i -= 2 {
 		if isStringMappingKey(mapNode.Content[i], key) {
-			existed = true
+			oldNode = mapNode.Content[i+1]
+			if oldNode != nil && oldNode.Kind == yaml.ScalarNode && oldNode.Tag != tag {
+				forceRewrite = true
+			}
 			break
 		}
+	}
+	if st != nil {
+		fullPath := append(tokenPathSegments(mapPathTokens), key)
+		recordNodeReplacementIntentLocked(st, fullPath, oldNode, yamlNodeSignature{kind: yaml.ScalarNode, tag: tag, exists: true})
 	}
 
 	// Always update the yaml.v3 AST first.
@@ -277,7 +353,12 @@ func setScalarValue(
 	}
 	if path, ok := st.subPathByHN[mapRef]; ok {
 		st.ordered = updateOrdered(st.ordered, path, key)
-		clearDeletionMarkersAtOrBelow(st, append(append([]string(nil), path...), key))
+		fullPath := append(append([]string(nil), path...), key)
+		clearDeletionMarkersAtOrBelow(st, fullPath)
+		if forceRewrite {
+			setForcedScalarIntentLocked(st, fullPath, tag)
+		}
+		recordExpectedASTLocked(st)
 		return
 	}
 
@@ -287,13 +368,14 @@ func setScalarValue(
 	if root := st.root(); root != nil && len(root.Content) > 0 {
 		if base, ok := addressableTokenPathToNode(root.Content[0], mapNode); ok {
 			full := append(append([]ptrToken(nil), base...), ptrToken{key: key})
-			logical := scalarLogicalValue(tag, val)
-			if updated, err := orderedUpsertAtPathTokens(st.ordered, full, logical); err == nil {
+			if updated, err := orderedUpsertAtPathTokens(st.ordered, full, logicalValue); err == nil {
 				st.ordered = updated
-				clearDeletionMarkersAtOrBelow(st, append(tokenPathSegments(base), key))
-				if !existed {
-					st.structuralDirty = true
+				fullPath := append(tokenPathSegments(base), key)
+				clearDeletionMarkersAtOrBelow(st, fullPath)
+				if forceRewrite {
+					setForcedScalarIntentLocked(st, fullPath, tag)
 				}
+				recordExpectedASTLocked(st)
 				return
 			}
 		}
@@ -303,51 +385,23 @@ func setScalarValue(
 	// In that case, we don't have a mapping-based path; instead, we locate the
 	// scalar occurrence by its byte offset and update the ordered view using a
 	// ptrToken path derived from valueOccByPathKey.
-	if updateScalarInSequenceOrdered(st, mapNode, key, tag, val) {
+	if updateScalarInSequenceOrdered(st, mapNode, key, logicalValue) {
 		// sequence items are not tracked in toDelete, so nothing to clear there
+		recordExpectedASTLocked(st)
 		return
 	}
 
-	// If we couldn't reconcile the ordered view for this mapping, mark the
-	// document as structurally dirty so surgery is avoided. (We still leave
-	// the AST updated; Marshal may fall back to structural rewrite.)
-	st.structuralDirty = true
-}
-
-func scalarLogicalValue(tag, val string) interface{} {
-	switch tag {
-	case "!!int":
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
-		}
-		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
-			return i
-		}
-	case "!!bool":
-		return strings.EqualFold(val, "true")
-	case "!!float":
-		switch strings.ToLower(val) {
-		case ".nan":
-			return math.NaN()
-		case ".inf", "+.inf":
-			return math.Inf(1)
-		case "-.inf":
-			return math.Inf(-1)
-		}
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
-			return f
-		}
-	case "!!null":
-		return nil
-	}
-	return val
+	// The AST remains updated even when this legacy source-offset lookup cannot
+	// reconcile the ordered shadow. Marshal compares it with the expected live
+	// tree and either finds a safe scoped rewrite or returns an error.
+	recordExpectedASTLocked(st)
 }
 
 // updateScalarInSequenceOrdered updates st.ordered for a scalar that lives inside
 // a mapping which itself is an item of a sequence. It discovers the logical
 // ptrToken path by matching the scalar node's byte position against
 // valueOccByPathKey entries and then calls orderedSetAtPathTokens.
-func updateScalarInSequenceOrdered(st *docState, mapNode *yaml.Node, key, tag, val string) bool {
+func updateScalarInSequenceOrdered(st *docState, mapNode *yaml.Node, key string, logicalValue any) bool {
 	if st == nil || mapNode == nil || mapNode.Kind != yaml.MappingNode {
 		return false
 	}
@@ -416,9 +470,7 @@ func updateScalarInSequenceOrdered(st *docState, mapNode *yaml.Node, key, tag, v
 	}
 	toks = append(toks, ptrToken{key: key})
 
-	logical := scalarLogicalValue(tag, val)
-
-	newOrdered, err := orderedSetAtPathTokens(st.ordered, toks, logical)
+	newOrdered, err := orderedSetAtPathTokens(st.ordered, toks, logicalValue)
 	if err != nil {
 		return false
 	}
@@ -429,32 +481,28 @@ func updateScalarInSequenceOrdered(st *docState, mapNode *yaml.Node, key, tag, v
 // SetScalarInt sets an integer value under the mapping node.
 func SetScalarInt(mapNode *yaml.Node, key string, value int) {
 	valStr := fmt.Sprintf("%d", value)
-	setScalarValue(mapNode, key, "!!int", valStr, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+	setScalarValue(mapNode, key, "!!int", valStr, value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
 		return setIntAtPath(ms, path, k, value)
 	})
 }
 
 func setScalarInt64(mapNode *yaml.Node, key string, value int64) {
 	valStr := strconv.FormatInt(value, 10)
-	setScalarValue(mapNode, key, "!!int", valStr, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+	setScalarValue(mapNode, key, "!!int", valStr, value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
 		return setAnyAtPath(ms, path, k, value)
 	})
 }
 
-func float64FitsInt(value float64) bool {
-	if math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value {
-		return false
-	}
-	if strconv.IntSize == 32 {
-		return value >= -(1<<31) && value <= 1<<31-1
-	}
-	limit := math.Ldexp(1, 63)
-	return value >= -limit && value < limit
+func setScalarUint64(mapNode *yaml.Node, key string, value uint64) {
+	valStr := strconv.FormatUint(value, 10)
+	setScalarValue(mapNode, key, "!!int", valStr, value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+		return setAnyAtPath(ms, path, k, value)
+	})
 }
 
 // SetScalarString sets a string value under the mapping node.
 func SetScalarString(mapNode *yaml.Node, key, value string) {
-	setScalarValue(mapNode, key, "!!str", value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+	setScalarValue(mapNode, key, "!!str", value, value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
 		return setStringAtPath(ms, path, k, value)
 	})
 }
@@ -467,7 +515,7 @@ func SetScalarBool(mapNode *yaml.Node, key string, value bool) {
 		valStr = "true"
 	}
 
-	setScalarValue(mapNode, key, "!!bool", valStr, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+	setScalarValue(mapNode, key, "!!bool", valStr, value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
 		return setBoolAtPath(ms, path, k, value)
 	})
 }
@@ -475,14 +523,24 @@ func SetScalarBool(mapNode *yaml.Node, key string, value bool) {
 // SetScalarFloat sets a float value under the mapping node.
 func SetScalarFloat(mapNode *yaml.Node, key string, value float64) {
 	valStr := formatYAMLFloat(value)
-	setScalarValue(mapNode, key, "!!float", valStr, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+	setScalarValue(mapNode, key, "!!float", valStr, value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
 		return setFloatAtPath(ms, path, k, value)
+	})
+}
+
+// setScalarJSONNumber preserves both the exact JSON number lexeme and its YAML
+// numeric category. json.Number is publicly constructible, so invalid values
+// are handled by SetValue as ordinary strings before reaching this helper.
+func setScalarJSONNumber(mapNode *yaml.Node, key string, value json.Number) {
+	tag, _ := scalarYAMLTag(value)
+	setScalarValue(mapNode, key, tag, value.String(), value, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+		return setAnyAtPath(ms, path, k, value)
 	})
 }
 
 // SetScalarNull sets a null value (!!null) under the mapping node.
 func SetScalarNull(mapNode *yaml.Node, key string) {
-	setScalarValue(mapNode, key, "!!null", "null", func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
+	setScalarValue(mapNode, key, "!!null", "null", nil, func(ms gyaml.MapSlice, path []string, k string) gyaml.MapSlice {
 		return setNullAtPath(ms, path, k)
 	})
 }
@@ -521,54 +579,45 @@ func SetStringMapValues(mapNode *yaml.Node, fields map[string]string, opts SetVa
 	}
 }
 
-// SetValue writes a scalar, mapping, or sequence value under a YAML mapping key.
+// SetValue replaces the value under a YAML mapping key with a scalar, mapping,
+// or sequence. A nil value deletes the key. SetMapValues remains the API for
+// merging a set of fields into an existing mapping.
 func SetValue(mapNode *yaml.Node, key string, value any, opts SetValueOptions) {
-	switch v := value.(type) {
-	case nil:
+	if value == nil {
 		DeleteKey(mapNode, key)
+		return
+	}
+	if text, ok := value.(string); ok && opts.DeleteEmptyStrings && strings.TrimSpace(text) == "" {
+		DeleteKey(mapNode, key)
+		return
+	}
+
+	// Normalize once before choosing the scalar-preserving or collection path.
+	// This gives a supported Go value the same YAML kind/tag regardless of
+	// whether it appears directly, inside a mapping, or inside a sequence.
+	orderedValue := orderedValueForSet(value, opts)
+	switch v := orderedValue.(type) {
 	case string:
-		if opts.DeleteEmptyStrings && strings.TrimSpace(v) == "" {
-			DeleteKey(mapNode, key)
-		} else {
-			SetScalarString(mapNode, key, v)
-		}
+		SetScalarString(mapNode, key, v)
 	case bool:
 		SetScalarBool(mapNode, key, v)
-	case int:
-		SetScalarInt(mapNode, key, v)
 	case int64:
-		if strconv.IntSize == 64 || (v >= -(1<<31) && v <= 1<<31-1) {
-			SetScalarInt(mapNode, key, int(v))
-		} else {
-			setScalarInt64(mapNode, key, v)
-		}
-	case float32:
-		SetScalarFloat(mapNode, key, float64(v))
+		setScalarInt64(mapNode, key, v)
+	case uint64:
+		setScalarUint64(mapNode, key, v)
 	case float64:
-		if float64FitsInt(v) {
-			SetScalarInt(mapNode, key, int(v))
-		} else {
-			SetScalarFloat(mapNode, key, v)
-		}
-	case []string:
-		values := make([]any, 0, len(v))
-		for _, item := range v {
-			values = append(values, item)
-		}
-		setSequenceValue(mapNode, key, values, opts)
-	case []any:
-		setSequenceValue(mapNode, key, v, opts)
-	case map[string]any:
-		child := EnsurePath(mapNode, key)
-		SetMapValues(child, v, opts)
+		SetScalarFloat(mapNode, key, v)
+	case json.Number:
+		setScalarJSONNumber(mapNode, key, v)
 	default:
-		SetScalarString(mapNode, key, fmt.Sprintf("%v", v))
+		setNodeValue(mapNode, key, orderedToYAMLNode(orderedValue), orderedValue)
 	}
 }
 
 // DeleteKey removes all occurrences of 'key' under 'mapNode'.
 // Surgical deletion removes the complete lines for the key’s occurrences.
-// If surgery is unsafe/unavailable, Marshal() falls back to a structured re-encode.
+// If exact deletion and a scoped rewrite are both unsafe, Marshal returns an
+// error instead of globally re-encoding unrelated content.
 func DeleteKey(mapNode *yaml.Node, key string) {
 	if mapNode == nil {
 		return
@@ -582,6 +631,7 @@ func DeleteKey(mapNode *yaml.Node, key string) {
 		}
 		st.mu.Lock()
 		defer st.mu.Unlock()
+		noteDirectASTMutationLocked(st)
 		root := st.root()
 		if root == nil || root != doc || len(root.Content) == 0 || mapNode.Kind != yaml.MappingNode {
 			return
@@ -603,6 +653,7 @@ func DeleteKey(mapNode *yaml.Node, key string) {
 
 	// Remove all pairs from the AST for the mapping node.
 	found := false
+	var retainedOld *yaml.Node
 	nc := make([]*yaml.Node, 0, len(mapNode.Content))
 	for i := 0; i+1 < len(mapNode.Content); i += 2 {
 		k := mapNode.Content[i]
@@ -611,6 +662,7 @@ func DeleteKey(mapNode *yaml.Node, key string) {
 			// drop the pair (k, v)
 			_ = v
 			found = true
+			retainedOld = v
 			continue
 		}
 		nc = append(nc, k, v)
@@ -623,19 +675,17 @@ func DeleteKey(mapNode *yaml.Node, key string) {
 	if !found {
 		return
 	}
-
-	if len(mapNode.Content) == 0 {
-		st.structuralDirty = true
-	}
+	fullPath := append(tokenPathSegments(pathTokens), key)
+	recordNodeRemovalIntentLocked(st, fullPath, retainedOld)
+	clearForcedScalarIntentAtOrBelow(st, fullPath)
 
 	// Update ordered map and mark deletion for surgery.
 	fullTokens := append(append([]ptrToken(nil), pathTokens...), ptrToken{key: key})
 	if updated, err := orderedRemoveAtPathTokens(st.ordered, fullTokens); err == nil {
 		st.ordered = updated
-	} else {
-		st.structuralDirty = true
 	}
 	st.toDelete[makePathKey(tokenPathSegments(pathTokens), key)] = struct{}{}
+	recordExpectedASTLocked(st)
 }
 
 // Ordered-map helpers shared by the setter helpers.
@@ -832,15 +882,6 @@ func setAnyAtPath(ms gyaml.MapSlice, path []string, key string, val interface{})
 	return ms
 }
 
-func setSequenceValue(mapNode *yaml.Node, key string, values []any, opts SetValueOptions) {
-	if len(values) == 0 {
-		DeleteKey(mapNode, key)
-		return
-	}
-	orderedValue := orderedValueForSet(values, opts)
-	setNodeValue(mapNode, key, orderedToYAMLNode(orderedValue), orderedValue)
-}
-
 func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedValue any) {
 	if mapNode == nil || valueNode == nil {
 		return
@@ -857,6 +898,7 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 		}
 		st.mu.Lock()
 		defer st.mu.Unlock()
+		noteDirectASTMutationLocked(st)
 		root := st.root()
 		if root == nil || root != docHN || len(root.Content) == 0 || mapNode.Kind != yaml.MappingNode {
 			return
@@ -875,10 +917,23 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 	if hasNonStringMappingKeyNamed(mapNode, key) {
 		return
 	}
+	var oldNode *yaml.Node
+	for index := len(mapNode.Content) - 2; index >= 0; index -= 2 {
+		if isStringMappingKey(mapNode.Content[index], key) {
+			oldNode = mapNode.Content[index+1]
+			break
+		}
+	}
+	// An alias stores a pointer to its anchor node, not merely the anchor name.
+	// Replacing that pointer would leave every external alias aimed at a detached
+	// node. Record the replacement intent before reusing the node below, so the
+	// intent still remembers the original kind/tag.
+	reuseAnchoredNode := oldNode != nil && oldNode.Anchor != ""
 
 	var updatedOrdered gyaml.MapSlice
 	if st != nil {
 		fullTokens := append(append([]ptrToken(nil), pathTokens...), ptrToken{key: key})
+		recordNodeReplacementIntentLocked(st, tokenPathSegments(fullTokens), oldNode, signatureOfYAMLNode(valueNode))
 		base := st.ordered
 		// setNodeValue removes every duplicate string-key occurrence from the
 		// AST, so remove logical duplicates before appending the replacement.
@@ -892,15 +947,46 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 		}
 	}
 
+	if reuseAnchoredNode {
+		// Retain the presentation attached to the exact source node, while kind
+		// and tag deliberately come from valueNode: SetValue replaces a custom-
+		// tagged value with the ordinary tag of the requested Go collection.
+		anchor := oldNode.Anchor
+		headComment := oldNode.HeadComment
+		lineComment := oldNode.LineComment
+		footComment := oldNode.FootComment
+		line := oldNode.Line
+		column := oldNode.Column
+
+		*oldNode = *valueNode
+		oldNode.Anchor = anchor
+		oldNode.HeadComment = headComment
+		oldNode.LineComment = lineComment
+		oldNode.FootComment = footComment
+		oldNode.Line = line
+		oldNode.Column = column
+		valueNode = oldNode
+	}
+
 	nextContent := make([]*yaml.Node, 0, len(mapNode.Content)+2)
+	replacementInserted := false
 	for i := 0; i+1 < len(mapNode.Content); i += 2 {
 		keyNode := mapNode.Content[i]
 		if isStringMappingKey(keyNode, key) {
+			// Keep an anchored replacement at its original mapping position. Moving
+			// it to the end could put a pre-existing alias before its anchor, which
+			// changes valid YAML into an invalid forward reference.
+			if reuseAnchoredNode && mapNode.Content[i+1] == oldNode {
+				nextContent = append(nextContent, keyNode, valueNode)
+				replacementInserted = true
+			}
 			continue
 		}
 		nextContent = append(nextContent, keyNode, mapNode.Content[i+1])
 	}
-	nextContent = append(nextContent, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, valueNode)
+	if !replacementInserted {
+		nextContent = append(nextContent, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, valueNode)
+	}
 	mapNode.Content = nextContent
 
 	if st == nil {
@@ -916,14 +1002,66 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 			indexMappingHandles(st, valueNode, path)
 		}
 	}
-	// Complex values have no source offsets, so force the safe structural
-	// renderer rather than attempting scalar byte surgery.
-	st.structuralDirty = true
+	recordExpectedASTLocked(st)
+}
+
+const (
+	// Keep caller-controlled collection graphs comfortably below the recursion
+	// depths used by the encoders and the ordered-shadow helpers. SetValue has no
+	// error return, so an unrepresentable branch is preserved as a diagnostic
+	// string instead of panicking or recursing without bound.
+	setValueMaxNestingDepth = 256
+	setValueNodeBudget      = 100_000
+
+	setValueCycleMarker = "<yamledit: cyclic value>"
+	setValueDepthMarker = "<yamledit: value nesting limit exceeded>"
+	setValueSizeMarker  = "<yamledit: value size limit exceeded>"
+)
+
+type setValueContainerIdentity struct {
+	kind reflect.Kind
+	ptr  uintptr
+	len  int
+	cap  int
+}
+
+type setValueNormalizer struct {
+	visiting  map[setValueContainerIdentity]struct{}
+	remaining int
 }
 
 func orderedValueForSet(value any, opts SetValueOptions) any {
+	normalizer := setValueNormalizer{
+		visiting:  make(map[setValueContainerIdentity]struct{}),
+		remaining: setValueNodeBudget,
+	}
+	return normalizer.normalize(value, opts, 0)
+}
+
+func (n *setValueNormalizer) normalize(value any, opts SetValueOptions, depth int) any {
+	if n.remaining <= 0 {
+		return setValueSizeMarker
+	}
+	n.remaining--
+
 	switch v := value.(type) {
 	case map[string]any:
+		if depth >= setValueMaxNestingDepth {
+			return setValueDepthMarker
+		}
+		identity := setValueContainerID(v)
+		if _, cyclic := n.visiting[identity]; cyclic {
+			return setValueCycleMarker
+		}
+		n.visiting[identity] = struct{}{}
+		defer delete(n.visiting, identity)
+
+		// Refuse an over-budget container before allocating and walking its keys.
+		// The remaining budget is also shared by its descendants.
+		if len(v) > n.remaining {
+			n.remaining = 0
+			return setValueSizeMarker
+		}
 		keys := make([]string, 0, len(v))
 		for key := range v {
 			keys = append(keys, key)
@@ -933,22 +1071,99 @@ func orderedValueForSet(value any, opts SetValueOptions) any {
 		}
 		items := make(gyaml.MapSlice, 0, len(keys))
 		for _, key := range keys {
-			items = append(items, gyaml.MapItem{Key: key, Value: orderedValueForSet(v[key], opts)})
+			if v[key] == nil {
+				// A nil passed for a mapping field has the same deletion/omission
+				// meaning as SetValue(mapping, key, nil, opts).
+				continue
+			}
+			if text, ok := v[key].(string); ok && opts.DeleteEmptyStrings && strings.TrimSpace(text) == "" {
+				continue
+			}
+			items = append(items, gyaml.MapItem{Key: key, Value: n.normalize(v[key], opts, depth+1)})
 		}
 		return items
 	case []string:
+		if depth >= setValueMaxNestingDepth {
+			return setValueDepthMarker
+		}
+		if len(v) > n.remaining {
+			n.remaining = 0
+			return setValueSizeMarker
+		}
+		n.remaining -= len(v)
 		out := make([]any, 0, len(v))
 		for _, item := range v {
 			out = append(out, item)
 		}
 		return out
 	case []any:
+		if depth >= setValueMaxNestingDepth {
+			return setValueDepthMarker
+		}
+		identity := setValueContainerID(v)
+		if _, cyclic := n.visiting[identity]; cyclic {
+			return setValueCycleMarker
+		}
+		n.visiting[identity] = struct{}{}
+		defer delete(n.visiting, identity)
+
+		if len(v) > n.remaining {
+			n.remaining = 0
+			return setValueSizeMarker
+		}
 		out := make([]any, 0, len(v))
 		for _, item := range v {
-			out = append(out, orderedValueForSet(item, opts))
+			out = append(out, n.normalize(item, opts, depth+1))
 		}
 		return out
-	default:
+	case int:
+		return int64(v)
+	case int8:
+		return int64(v)
+	case int16:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case int64:
 		return v
+	case uint:
+		return uint64(v)
+	case uint8:
+		return uint64(v)
+	case uint16:
+		return uint64(v)
+	case uint32:
+		return uint64(v)
+	case uint64:
+		return v
+	case float32:
+		return float64(v)
+	case float64, bool, string, nil:
+		return v
+	case json.Number:
+		if !isValidJSONNumber(v) {
+			// SetValue cannot return a validation error. Match its existing fallback
+			// for unsupported scalar types by preserving the caller's text as a YAML
+			// string, never as trusted syntax that could escape its containing value.
+			return string(v)
+		}
+		return v
+	default:
+		// Preserve SetValue's established best-effort behavior for unsupported
+		// values, but normalize it here so nested and direct values agree.
+		return fmt.Sprintf("%v", v)
 	}
+}
+
+func setValueContainerID(value any) setValueContainerIdentity {
+	rv := reflect.ValueOf(value)
+	identity := setValueContainerIdentity{kind: rv.Kind(), ptr: rv.Pointer()}
+	if rv.Kind() == reflect.Slice {
+		// Slices sharing a backing array are not necessarily the same logical
+		// container. Include the complete header shape so only a recursive visit
+		// to the same view is classified as a cycle.
+		identity.len = rv.Len()
+		identity.cap = rv.Cap()
+	}
+	return identity
 }

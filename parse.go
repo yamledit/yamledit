@@ -82,7 +82,6 @@ func normalizeImplicitMaps(doc *yaml.Node, st *docState) {
 					if updated, err := setOrderedAtPath(st.ordered, fullPath, gyaml.MapSlice{}); err == nil {
 						st.ordered = updated
 					}
-					st.structuralDirty = true
 					continue
 				}
 				walk(value, append(path, ptrToken{key: key.Value}))
@@ -140,6 +139,9 @@ func Parse(data []byte) (*yaml.Node, error) {
 		unsafePathKeys:     map[string]struct{}{},
 		opaquePathKeys:     map[string]struct{}{},
 		seqIndex:           map[string]*seqInfo{},
+		forceScalarRewrite: map[string]struct{}{},
+		forceScalarTags:    map[string]string{},
+		nodeRewriteIntents: map[string]nodeRewriteIntent{},
 		toDelete:           map[string]struct{}{},
 	}
 	if st.originalRootEmpty {
@@ -180,10 +182,17 @@ func Parse(data []byte) (*yaml.Node, error) {
 		}
 	}
 
+	// goccy may use shared backing storage for an anchor target and the logical
+	// expansion of its aliases. Detach the live shadow before edits so changing
+	// the target cannot accidentally mutate an alias entry (or vice versa).
+	st.ordered = cloneMapSlice(st.ordered)
+
 	// Keep a snapshot of the original ordered map for diffing
 	st.origOrdered = cloneMapSlice(st.ordered)
 
 	normalizeImplicitMaps(doc, st)
+	st.originalAST = cloneYAMLNodeGraph(doc)
+	st.expectedAST = cloneYAMLNodeGraph(doc)
 
 	// Index mapping handles (for path lookups later on)
 	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode {
@@ -235,13 +244,22 @@ func yamlNodeToOrderedValueSeen(node *yaml.Node, visiting map[*yaml.Node]bool, b
 		if len(node.Content) == 0 {
 			return gyaml.MapSlice{}, nil
 		}
+		if len(node.Content) != 1 || node.Content[0] == nil {
+			return nil, fmt.Errorf("malformed YAML document node")
+		}
 		return yamlNodeToOrderedValueSeen(node.Content[0], visiting, budget)
 	case yaml.MappingNode:
+		if len(node.Content)%2 != 0 {
+			return nil, fmt.Errorf("malformed YAML mapping node")
+		}
 		out := make(gyaml.MapSlice, 0, len(node.Content)/2)
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			key := node.Content[i]
+			if key == nil || node.Content[i+1] == nil {
+				return nil, fmt.Errorf("malformed YAML mapping node")
+			}
 			if key.Kind != yaml.ScalarNode {
-				continue
+				return nil, fmt.Errorf("YAML mapping has a non-scalar key")
 			}
 			value, err := yamlNodeToOrderedValueSeen(node.Content[i+1], visiting, budget)
 			if err != nil {
@@ -253,6 +271,9 @@ func yamlNodeToOrderedValueSeen(node *yaml.Node, visiting map[*yaml.Node]bool, b
 	case yaml.SequenceNode:
 		out := make([]interface{}, 0, len(node.Content))
 		for _, child := range node.Content {
+			if child == nil {
+				return nil, fmt.Errorf("malformed YAML sequence node")
+			}
 			value, err := yamlNodeToOrderedValueSeen(child, visiting, budget)
 			if err != nil {
 				return nil, err
@@ -276,55 +297,20 @@ func yamlNodeToOrderedValueSeen(node *yaml.Node, visiting map[*yaml.Node]bool, b
 	}
 }
 
-// indexSeqPositions indexes scalar positions for sequence items which are mapping nodes.
+// indexSeqPositions indexes block mapping items within a sequence. Route each
+// item through the ordinary mapping indexer so the item mapping itself gets a
+// mapInfo insertion anchor in addition to its existing scalar and descendant
+// indexes.
 func indexSeqPositions(st *docState, seq *yaml.Node, cur []string) {
 	if seq == nil || seq.Kind != yaml.SequenceNode || seq.Style&yaml.FlowStyle != 0 {
 		return
 	}
 	for idx, it := range seq.Content {
-		if it == nil {
+		if it == nil || it.Kind != yaml.MappingNode {
 			continue
 		}
-		if it.Kind == yaml.MappingNode {
-			for j := 0; j+1 < len(it.Content); j += 2 {
-				k := it.Content[j]
-				v := it.Content[j+1]
-
-				if k.Kind != yaml.ScalarNode {
-					continue
-				}
-
-				// RECURSION FIX: If the sequence item value is a mapping, we must recurse
-				// to index its children (so surgical updates deep in the array work).
-				if v.Kind == yaml.MappingNode {
-					childPath := append(append([]string(nil), cur...), fmt.Sprintf("[%d]", idx), k.Value)
-					indexPositions(st, v, childPath)
-					continue
-				}
-
-				if v.Kind != yaml.ScalarNode {
-					continue
-				}
-
-				valStart := scalarValueOffset(st.original, st.lineOffsets, v)
-				if valStart < 0 || valStart >= len(st.original) {
-					continue
-				}
-				valEnd := findScalarEndOnLine(st.original, valStart)
-				lineEnd := findLineEnd(st.original, valStart)
-				pk := makeSeqPathKey(cur, idx, k.Value)
-				st.valueOccByPathKey[pk] = append(st.valueOccByPathKey[pk], valueOcc{
-					keyLineStart: lineStartOffset(st.lineOffsets, k.Line),
-					valStart:     valStart,
-					valEnd:       valEnd,
-					lineEnd:      lineEnd,
-					tag:          v.Tag,
-					explicitTag:  scalarHasExplicitTag(st.original, st.lineOffsets, v),
-					blockStyle:   v.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0,
-					multiline:    scalarSpansPhysicalLines(st.original, v, valStart, k.Column-1),
-				})
-			}
-		}
+		itemPath := append(append([]string(nil), cur...), indexSeg(idx))
+		indexPositions(st, it, itemPath)
 	}
 }
 
@@ -463,6 +449,15 @@ func indexSequenceAnchors(st *docState, seq *yaml.Node, cur []string) {
 			end = maxLineEndForNode(st, it)
 			if end == 0 {
 				end = findLineEnd(st.original, start)
+			}
+		}
+		// Node positions identify token starts, not general token ends. Extend an
+		// item through quoted scalars and flow collections that close on a later
+		// line so a whole-sequence rewrite cannot leave continuation bytes behind.
+		if delimitedEnd := sourceDelimitedSubtreeEnd(st.original, st.lineOffsets, it); delimitedEnd > 0 {
+			lastTokenByte := min(delimitedEnd-1, len(st.original)-1)
+			if tokenLineEnd := findLineEnd(st.original, lastTokenByte); tokenLineEnd > end {
+				end = tokenLineEnd
 			}
 		}
 
@@ -649,6 +644,27 @@ func indexPositions(st *docState, n *yaml.Node, cur []string) {
 					}
 					lineEnd = extendScalarBlockEnd(st.original, st.lineOffsets, v.Line, keyIndent)
 				}
+			}
+		}
+
+		// yaml.v3 positions identify token starts, not their complete lexical
+		// extent. A mapping insertion is anchored after the last original value,
+		// so extend that anchor through multiline quoted scalars and flow
+		// collections even when their continuation closes at a lower indentation.
+		if lexicalEnd := sourceDelimitedSubtreeEnd(st.original, st.lineOffsets, v); lexicalEnd > 0 {
+			lastTokenByte := min(lexicalEnd-1, len(st.original)-1)
+			if tokenLineEnd := findLineEnd(st.original, lastTokenByte); tokenLineEnd > lineEnd {
+				lineEnd = tokenLineEnd
+			}
+		}
+		// Plain scalars have no closing delimiter. Extend them only through
+		// physical continuation lines more indented than their owning key. Using
+		// maxLineEndForNode here would infer the sequence-item indentation and may
+		// overrun a later field in an inline `- key: value` mapping.
+		if v.Kind == yaml.ScalarNode && v.Style == 0 && valStart >= 0 && valStart < len(st.original) &&
+			scalarSpansPhysicalLines(st.original, v, valStart, k.Column-1) {
+			if scalarLineEnd := extendScalarBlockEnd(st.original, st.lineOffsets, v.Line, k.Column-1); scalarLineEnd > lineEnd {
+				lineEnd = scalarLineEnd
 			}
 		}
 

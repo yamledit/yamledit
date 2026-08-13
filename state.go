@@ -12,25 +12,38 @@ import (
 
 // Internal state registered per root yaml.DocumentNode.
 type docState struct {
-	mu          sync.RWMutex
-	doc         weak.Pointer[yaml.Node]              // weak reference to the root document
-	indent      int                                  // detected indent (2,3,4,...)
-	indentSeq   bool                                 // whether sequences under a key are indented
-	ordered     gyaml.MapSlice                       // current ordered mapping we edit (live view)
-	comments    gyaml.CommentMap                     // captured comments (for fallback encode)
-	subPathByHN map[weak.Pointer[yaml.Node]][]string // weak mapping-handle -> path segments
+	mu  sync.RWMutex
+	doc weak.Pointer[yaml.Node] // weak reference to the root document
+	// expectedAST is a graph-preserving snapshot of the live tree after the last
+	// state-aware library mutation. Marshal compares it with the public yaml.Node
+	// tree to detect direct caller edits, including presentation-only changes that
+	// cannot be represented in the ordered logical shadow.
+	expectedAST *yaml.Node
+	// originalAST is an immutable graph snapshot of the normalized source tree.
+	// Node-rewrite intents are compared with the node originally occupying their
+	// final path, which remains correct when sequence insertions rebase an edit.
+	originalAST *yaml.Node
+	// directASTDirty remains set if a public mutator observes that the caller had
+	// already changed the live tree. A later library snapshot must not bless and
+	// then silently discard that earlier direct presentation edit.
+	directASTDirty bool
+	indent         int                                  // detected indent (2,3,4,...)
+	indentSeq      bool                                 // whether sequences under a key are indented
+	ordered        gyaml.MapSlice                       // current ordered mapping we edit (live view)
+	comments       gyaml.CommentMap                     // captured comments (for fallback encode)
+	subPathByHN    map[weak.Pointer[yaml.Node]][]string // weak mapping-handle -> path segments
 
 	// --- Byte-surgical indices ---
 	original []byte // original file bytes (exact)
 	// originalRootEmpty records a non-empty source document whose root was an
 	// explicit empty mapping (for example "{}"). Such a document has no byte
 	// insertion anchor, so the first real edit must use the standard encoder.
-	originalRootEmpty bool
+	originalRootEmpty  bool
 	originalTriviaOnly bool
-	rootTokenStart    int
-	rootTokenEnd      int
-	lineOffsets       []int // starting offset of each line in original
-	origOrdered       gyaml.MapSlice
+	rootTokenStart     int
+	rootTokenEnd       int
+	lineOffsets        []int // starting offset of each line in original
+	origOrdered        gyaml.MapSlice
 
 	// Map-level index: information about each mapping path found in the original bytes
 	mapIndex map[string]*mapInfo
@@ -45,10 +58,258 @@ type docState struct {
 	opaquePathKeys  map[string]struct{} // container rewrites would lose source-only metadata
 
 	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
+	// forceScalarRewrite records scalar paths whose requested YAML tag changed
+	// even though their projected Go value did not (for example timestamp to
+	// string with the same spelling).
+	forceScalarRewrite map[string]struct{}
+	// forceScalarTags stores the requested target tag for each forced rewrite.
+	// A later operation at the same path can then cancel or replace stale intent.
+	forceScalarTags map[string]string
+	// nodeRewriteIntents records the YAML kind/tag at a path before the first
+	// state-aware replacement and the kind/tag most recently requested there.
+	// The ordered logical shadow deliberately omits YAML tags, so a replacement
+	// can otherwise appear to be a no-op and Marshal may return the original tag.
+	// Keeping the origin across several operations also handles delete/re-add and
+	// complex-to-scalar round trips without treating edits inside a tagged
+	// collection as a replacement of that collection itself.
+	nodeRewriteIntents map[string]nodeRewriteIntent
 
 	// explicit deletions requested (path\0key)
-	toDelete        map[string]struct{}
-	structuralDirty bool // when true, skip surgery and fall back to full encode
+	toDelete map[string]struct{}
+}
+
+type yamlNodeSignature struct {
+	kind   yaml.Kind
+	tag    string
+	exists bool
+}
+
+type nodeRewriteIntent struct {
+	origin yamlNodeSignature
+	target yamlNodeSignature
+}
+
+func signatureOfYAMLNode(node *yaml.Node) yamlNodeSignature {
+	if node == nil {
+		return yamlNodeSignature{}
+	}
+	return yamlNodeSignature{kind: node.Kind, tag: node.Tag, exists: true}
+}
+
+func sameYAMLNodeSignature(left, right yamlNodeSignature) bool {
+	return left.exists == right.exists && (!left.exists || left.kind == right.kind && left.tag == right.tag)
+}
+
+// recordNodeReplacementIntentLocked records an exact-path replacement. old is
+// the node visible before the replacement and target is the requested output
+// kind/tag. An existing origin is retained so a sequence such as
+// custom-scalar -> mapping -> string is compared with the original custom tag,
+// not merely with the intermediate mapping.
+func recordNodeReplacementIntentLocked(st *docState, path []string, old *yaml.Node, target yamlNodeSignature) {
+	if st == nil || len(path) == 0 || !target.exists {
+		return
+	}
+	if st.nodeRewriteIntents == nil {
+		st.nodeRewriteIntents = make(map[string]nodeRewriteIntent)
+	}
+	encoded := joinPath(path)
+	intent, seen := st.nodeRewriteIntents[encoded]
+	if !seen {
+		intent.origin = signatureOfYAMLNode(old)
+	}
+	intent.target = target
+	st.nodeRewriteIntents[encoded] = intent
+
+	// Replacing a container also replaces every descendant. Preserve each
+	// descendant's origin for a possible later recreation, but do not enforce a
+	// stale target while that old subtree is absent.
+	for descendant, childIntent := range st.nodeRewriteIntents {
+		if descendant == encoded {
+			continue
+		}
+		segments, ok := splitJoinedPath(descendant)
+		if ok && len(segments) > len(path) && pathSegmentsEqual(segments[:len(path)], path) {
+			childIntent.target = yamlNodeSignature{}
+			st.nodeRewriteIntents[descendant] = childIntent
+		}
+	}
+}
+
+func recordNodeRemovalIntentLocked(st *docState, path []string, old *yaml.Node) {
+	if st == nil || len(path) == 0 {
+		return
+	}
+	if st.nodeRewriteIntents == nil {
+		st.nodeRewriteIntents = make(map[string]nodeRewriteIntent)
+	}
+	encoded := joinPath(path)
+	intent, seen := st.nodeRewriteIntents[encoded]
+	if !seen {
+		intent.origin = signatureOfYAMLNode(old)
+	}
+	intent.target = yamlNodeSignature{}
+	st.nodeRewriteIntents[encoded] = intent
+	for descendant, childIntent := range st.nodeRewriteIntents {
+		segments, ok := splitJoinedPath(descendant)
+		if ok && len(segments) > len(path) && pathSegmentsEqual(segments[:len(path)], path) {
+			childIntent.target = yamlNodeSignature{}
+			st.nodeRewriteIntents[descendant] = childIntent
+		}
+	}
+}
+
+// recordShiftedSubtreeIntentsLocked snapshots the kind/tag signatures now
+// occupying a sequence index after an insertion or removal. Logical sequence
+// values do not carry custom YAML tags, and every later item can shift across a
+// source position with different metadata even when all values compare equal.
+// Record the full addressable subtree against the immutable source paths so
+// Marshal validates (and, if needed, rewrites) every such difference.
+func recordShiftedSubtreeIntentsLocked(st *docState, path []string, shifted *yaml.Node) {
+	if st == nil || len(path) == 0 || shifted == nil {
+		return
+	}
+	if st.nodeRewriteIntents == nil {
+		st.nodeRewriteIntents = make(map[string]nodeRewriteIntent)
+	}
+	originalRoot := st.originalAST
+	if originalRoot != nil && originalRoot.Kind == yaml.DocumentNode && len(originalRoot.Content) == 1 {
+		originalRoot = originalRoot.Content[0]
+	}
+
+	var walk func(*yaml.Node, []string)
+	walk = func(current *yaml.Node, currentPath []string) {
+		if current == nil {
+			return
+		}
+		original, exists := yamlNodeAtPathSegments(originalRoot, currentPath)
+		encoded := joinPath(currentPath)
+		if exists {
+			st.nodeRewriteIntents[encoded] = nodeRewriteIntent{
+				origin: signatureOfYAMLNode(original),
+				target: signatureOfYAMLNode(current),
+			}
+		} else {
+			// No source node occupies this final path (for example an append beyond
+			// the original sequence length). Any rebased history here belongs to a
+			// different item and must not constrain the new subtree.
+			delete(st.nodeRewriteIntents, encoded)
+		}
+		switch current.Kind {
+		case yaml.MappingNode:
+			for index := 0; index+1 < len(current.Content); index += 2 {
+				key, value := current.Content[index], current.Content[index+1]
+				if key == nil || value == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+					continue
+				}
+				childPath := append(append([]string(nil), currentPath...), key.Value)
+				walk(value, childPath)
+			}
+		case yaml.SequenceNode:
+			for index, value := range current.Content {
+				childPath := append(append([]string(nil), currentPath...), indexSeg(index))
+				walk(value, childPath)
+			}
+		}
+	}
+	walk(shifted, path)
+}
+
+func yamlNodeAtPathSegments(root *yaml.Node, path []string) (*yaml.Node, bool) {
+	current := root
+	for _, segment := range path {
+		if current == nil {
+			return nil, false
+		}
+		switch current.Kind {
+		case yaml.MappingNode:
+			var child *yaml.Node
+			for index := len(current.Content) - 2; index >= 0; index -= 2 {
+				if isStringMappingKey(current.Content[index], segment) {
+					child = current.Content[index+1]
+					break
+				}
+			}
+			if child == nil {
+				return nil, false
+			}
+			current = child
+		case yaml.SequenceNode:
+			if !isIndexPathSegment(segment) {
+				return nil, false
+			}
+			index, err := strconv.Atoi(segment[1 : len(segment)-1])
+			if err != nil || index < 0 || index >= len(current.Content) {
+				return nil, false
+			}
+			current = current.Content[index]
+		default:
+			return nil, false
+		}
+	}
+	return current, current != nil
+}
+
+// activeNodeRewriteIntentsLocked returns only final, live replacements whose
+// requested kind/tag differs from the node in the original source at that final
+// path. Comparing at Marshal time is important for sequence insertions: an edit
+// intent can move to another index, and its output must then be compared with
+// the bytes originally occupying the rebased index.
+// The caller must hold st.mu. Stale intents are ignored; a mismatch between the
+// live node and the recorded target can only arise from a direct AST edit, which
+// Marshal handles by encoding the live tree.
+func activeNodeRewriteIntentsLocked(st *docState, root *yaml.Node) map[string]yamlNodeSignature {
+	active := make(map[string]yamlNodeSignature)
+	if st == nil || root == nil {
+		return active
+	}
+	for encoded, intent := range st.nodeRewriteIntents {
+		if !intent.target.exists {
+			continue
+		}
+		path, ok := splitJoinedPath(encoded)
+		if !ok {
+			continue
+		}
+		current, exists := yamlNodeAtPathSegments(root, path)
+		if !exists || !sameYAMLNodeSignature(signatureOfYAMLNode(current), intent.target) {
+			continue
+		}
+		originalRoot := st.originalAST
+		if originalRoot != nil && originalRoot.Kind == yaml.DocumentNode && len(originalRoot.Content) == 1 {
+			originalRoot = originalRoot.Content[0]
+		}
+		original, existedOriginally := yamlNodeAtPathSegments(originalRoot, path)
+		if !existedOriginally || sameYAMLNodeSignature(signatureOfYAMLNode(original), intent.target) {
+			continue
+		}
+		if !intent.origin.exists {
+			// A genuinely new node at an index must not be compared with the old
+			// occupant that was shifted away by insertion. An origin-less intent is
+			// only a replacement when a preceding remove explicitly left a tombstone
+			// for this exact path.
+			continue
+		}
+		active[encoded] = intent.target
+	}
+	return active
+}
+
+// hasNodeRewriteIntentAtOrBelow reports whether an edit explicitly replaced the
+// node at path or one of its descendants. It is used to distinguish an ordinary
+// sequence index shift (which should rebase existing intents) from removal of a
+// node that itself owns a replacement history (whose origin must remain at the
+// now-vacant index for a possible re-add).
+func hasNodeRewriteIntentAtOrBelow(st *docState, path []string) bool {
+	if st == nil {
+		return false
+	}
+	for encoded := range st.nodeRewriteIntents {
+		segments, ok := splitJoinedPath(encoded)
+		if ok && len(segments) >= len(path) && pathSegmentsEqual(segments[:len(path)], path) {
+			return true
+		}
+	}
+	return false
 }
 
 func (st *docState) root() *yaml.Node {
@@ -182,26 +443,7 @@ func findOwnerByMapNode(mapNode *yaml.Node) (*docState, *yaml.Node, []string, bo
 	for _, s := range states {
 		s.mu.RLock()
 		doc := s.doc.Value()
-		found := false
-		var walk func(*yaml.Node)
-		walk = func(n *yaml.Node) {
-			if n == nil || found {
-				return
-			}
-			if n == mapNode {
-				found = true
-				return
-			}
-			for _, c := range n.Content {
-				walk(c)
-				if found {
-					return
-				}
-			}
-		}
-		if doc != nil && len(doc.Content) > 0 {
-			walk(doc.Content[0])
-		}
+		found := doc != nil && len(doc.Content) > 0 && contentNodeReachable(doc.Content[0], mapNode)
 		s.mu.RUnlock()
 		if found {
 			return s, doc, nil, true
@@ -267,30 +509,93 @@ func findRegisteredNodeOwner(node *yaml.Node) (st *docState, doc *yaml.Node, isD
 	return st, doc, false, ok
 }
 
-func tokenPathToNode(cur, target *yaml.Node, path []ptrToken) ([]ptrToken, bool) {
-	if cur == nil {
+// contentNodeReachable scans only Content edges. Public yaml.Node trees are
+// mutable, so ownership discovery must tolerate malformed cycles rather than
+// recurse forever before the API can reject or ignore the caller's handle.
+func contentNodeReachable(root, target *yaml.Node) bool {
+	if root == nil || target == nil {
+		return false
+	}
+	stack := []*yaml.Node{root}
+	seen := make(map[*yaml.Node]struct{})
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		node := stack[last]
+		stack = stack[:last]
+		if node == nil {
+			continue
+		}
+		if node == target {
+			return true
+		}
+		if _, visited := seen[node]; visited {
+			continue
+		}
+		seen[node] = struct{}{}
+		stack = append(stack, node.Content...)
+	}
+	return false
+}
+
+type ownershipPathFrame struct {
+	node   *yaml.Node
+	parent *ownershipPathFrame
+	token  ptrToken
+	depth  int
+}
+
+func ownershipPath(frame *ownershipPathFrame) []ptrToken {
+	path := make([]ptrToken, frame.depth)
+	for frame.parent != nil {
+		path[frame.depth-1] = frame.token
+		frame = frame.parent
+	}
+	return path
+}
+
+func tokenPathToNode(root, target *yaml.Node, prefix []ptrToken) ([]ptrToken, bool) {
+	if root == nil || target == nil {
 		return nil, false
 	}
-	if cur == target {
-		return append([]ptrToken(nil), path...), true
-	}
-	switch cur.Kind {
-	case yaml.MappingNode:
-		for i := 0; i+1 < len(cur.Content); i += 2 {
-			key, value := cur.Content[i], cur.Content[i+1]
-			if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
-				continue
-			}
-			next := append(append([]ptrToken(nil), path...), ptrToken{key: key.Value})
-			if found, ok := tokenPathToNode(value, target, next); ok {
-				return found, true
-			}
+	base := &ownershipPathFrame{node: root}
+	stack := []*ownershipPathFrame{base}
+	seen := make(map[*yaml.Node]struct{})
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		frame := stack[last]
+		stack = stack[:last]
+		node := frame.node
+		if node == nil {
+			continue
 		}
-	case yaml.SequenceNode:
-		for i, value := range cur.Content {
-			next := append(append([]ptrToken(nil), path...), ptrToken{key: strconv.Itoa(i), isIdx: true, index: i})
-			if found, ok := tokenPathToNode(value, target, next); ok {
-				return found, true
+		if node == target {
+			path := append([]ptrToken(nil), prefix...)
+			return append(path, ownershipPath(frame)...), true
+		}
+		if _, visited := seen[node]; visited {
+			continue
+		}
+		seen[node] = struct{}{}
+
+		switch node.Kind {
+		case yaml.MappingNode:
+			// Push children in reverse source order so the LIFO traversal retains
+			// the recursive implementation's first-to-last search order.
+			for i := (len(node.Content)/2 - 1) * 2; i >= 0; i -= 2 {
+				key, value := node.Content[i], node.Content[i+1]
+				if key == nil || value == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+					continue
+				}
+				stack = append(stack, &ownershipPathFrame{
+					node: value, parent: frame, token: ptrToken{key: key.Value}, depth: frame.depth + 1,
+				})
+			}
+		case yaml.SequenceNode:
+			for index := len(node.Content) - 1; index >= 0; index-- {
+				stack = append(stack, &ownershipPathFrame{
+					node: node.Content[index], parent: frame,
+					token: ptrToken{key: strconv.Itoa(index), isIdx: true, index: index}, depth: frame.depth + 1,
+				})
 			}
 		}
 	}

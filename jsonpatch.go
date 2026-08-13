@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"reflect"
 	"sort"
 	"strconv"
@@ -73,13 +74,47 @@ type patchOp struct {
 }
 
 func (op *patchOp) UnmarshalJSON(data []byte) error {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(data, &members); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	first, err := dec.Token()
+	if err != nil {
 		return err
 	}
-	if members == nil {
+	if delim, ok := first.(json.Delim); !ok || delim != '{' {
 		return errors.New("operation must be an object")
 	}
+
+	// Do not decode through a map: JSON permits duplicate object member names,
+	// while RFC 6902 requires exactly one occurrence of each member defined for
+	// the selected operation. Keep every occurrence until op is known; members
+	// irrelevant to that operation are ignored as RFC 6902 requires.
+	members := make(map[string]json.RawMessage)
+	memberCounts := make(map[string]int)
+	for dec.More() {
+		nameToken, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := nameToken.(string)
+		if !ok {
+			return errors.New("operation member name must be a string")
+		}
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return err
+		}
+		switch name {
+		case "op", "path", "value", "from":
+			memberCounts[name]++
+			members[name] = append(json.RawMessage(nil), raw...)
+		}
+	}
+	if _, err := dec.Token(); err != nil { // closing '}'
+		return err
+	}
+
+	// A decoder may reuse a destination. Reset presence flags and raw fields so
+	// an omitted member cannot inherit state from an earlier operation.
+	*op = patchOp{}
 	decodeRequiredString := func(name string) (string, error) {
 		raw, ok := members[name]
 		if !ok {
@@ -95,12 +130,23 @@ func (op *patchOp) UnmarshalJSON(data []byte) error {
 		return value, nil
 	}
 
-	var err error
 	if op.Op, err = decodeRequiredString("op"); err != nil {
 		return err
 	}
 	if op.Path, err = decodeRequiredString("path"); err != nil {
 		return err
+	}
+	if memberCounts["op"] != 1 {
+		return errors.New("duplicate member \"op\"")
+	}
+	if memberCounts["path"] != 1 {
+		return errors.New("duplicate member \"path\"")
+	}
+	if (op.Op == "add" || op.Op == "replace" || op.Op == "test") && memberCounts["value"] > 1 {
+		return errors.New("duplicate member \"value\"")
+	}
+	if (op.Op == "move" || op.Op == "copy") && memberCounts["from"] > 1 {
+		return errors.New("duplicate member \"from\"")
 	}
 	if raw, ok := members["value"]; ok {
 		op.Value = append(op.Value[:0], raw...)
@@ -245,10 +291,32 @@ func applyDecodedPatch(node *yaml.Node, ops []patchOp, basePath []string) error 
 		st.mu.Lock()
 		defer st.mu.Unlock()
 		startMap, baseFromRoot, err = resolveRegisteredStartLocked(node, st, docHN, isDocument)
+		if err == nil {
+			// Resolve the handle first so a concurrently converted MappingNode can
+			// report its ordinary wrong-kind error. Once the target is confirmed as
+			// a mapping, validate the complete owning document: an alias elsewhere
+			// can target this subtree, and malformed Content must be rejected before
+			// graph cloning or mutation.
+			if validateErr := validateYAMLMarshalDocument(docHN); validateErr != nil {
+				err = fmt.Errorf("yamledit: cannot apply JSON Patch to malformed YAML: %w", validateErr)
+			} else {
+				noteDirectASTMutationLocked(st)
+			}
+		}
 	} else {
 		// Nodes that were not returned by Parse have no shared docState contract,
-		// so preserve the existing standalone DocumentNode/MappingNode behavior.
+		// so validate their shape explicitly before cloning or mutation.
 		startMap, err = resolveUnregisteredStart(node)
+		if err == nil {
+			if node.Kind == yaml.DocumentNode {
+				err = validateYAMLMarshalDocument(node)
+			} else {
+				err = validateYAMLContentTree(node)
+			}
+			if err != nil {
+				err = fmt.Errorf("yamledit: cannot apply JSON Patch to malformed YAML: %w", err)
+			}
+		}
 	}
 	if err != nil {
 		return err
@@ -291,7 +359,25 @@ func applyDecodedPatch(node *yaml.Node, ops []patchOp, basePath []string) error 
 	if err := executeDecodedPatch(preflightStart, preflightState, preflightDoc, baseFromRoot, ops, baseTokens); err != nil {
 		return err
 	}
-	return executeDecodedPatch(startMap, st, docHN, baseFromRoot, ops, baseTokens)
+	// Replacing an ancestor can remove an anchored descendant while leaving an
+	// alias elsewhere in the document pointing at the now-detached node. The
+	// individual operation cannot reliably see every external alias when the
+	// patch starts at a nested mapping, so validate the complete cloned graph at
+	// the atomic preflight boundary before making the same edits to the live AST.
+	preflightRoot := preflightStart
+	if preflightDoc != nil {
+		preflightRoot = preflightDoc
+	}
+	if err := validateYAMLAliasGraph(preflightRoot); err != nil {
+		return fmt.Errorf("yamledit: JSON Patch would produce an invalid YAML alias graph: %w", err)
+	}
+	if err := executeDecodedPatch(startMap, st, docHN, baseFromRoot, ops, baseTokens); err != nil {
+		return err
+	}
+	if st != nil {
+		st.expectedAST = cloneYAMLNodeGraph(docHN)
+	}
+	return nil
 }
 
 func executeDecodedPatch(startMap *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []ptrToken, ops []patchOp, baseTokens []ptrToken) error {
@@ -384,7 +470,7 @@ func cloneYAMLNodeGraphWithMap(root *yaml.Node) (*yaml.Node, map[*yaml.Node]*yam
 func resolveUnregisteredStart(node *yaml.Node) (*yaml.Node, error) {
 	switch node.Kind {
 	case yaml.DocumentNode:
-		if len(node.Content) == 0 || node.Content[0].Kind != yaml.MappingNode {
+		if len(node.Content) != 1 || node.Content[0] == nil || node.Content[0].Kind != yaml.MappingNode {
 			return nil, errors.New("yamledit: document root is not a mapping")
 		}
 		return node.Content[0], nil
@@ -399,11 +485,14 @@ func resolveUnregisteredStart(node *yaml.Node) (*yaml.Node, error) {
 // target. The caller must hold st.mu for writing.
 func resolveRegisteredStartLocked(node *yaml.Node, st *docState, docHN *yaml.Node, isDocument bool) (*yaml.Node, []ptrToken, error) {
 	rootDoc := st.root()
-	if rootDoc == nil || rootDoc != docHN || len(rootDoc.Content) == 0 {
+	if rootDoc == nil || rootDoc != docHN {
 		return nil, nil, errors.New("yamledit: document is no longer available")
 	}
+	if rootDoc.Kind != yaml.DocumentNode || len(rootDoc.Content) != 1 || rootDoc.Content[0] == nil || rootDoc.Content[0].Kind != yaml.MappingNode {
+		return nil, nil, errors.New("yamledit: document root is not a mapping")
+	}
 	if isDocument {
-		if node != rootDoc || node.Kind != yaml.DocumentNode || node.Content[0].Kind != yaml.MappingNode {
+		if node != rootDoc || node.Kind != yaml.DocumentNode {
 			return nil, nil, errors.New("yamledit: document root is not a mapping")
 		}
 		return node.Content[0], nil, nil
@@ -478,7 +567,11 @@ func jsonValueToYAMLNode(v interface{}) *yaml.Node {
 		if strings.ContainsAny(string(t), ".eE") {
 			tag = "!!float"
 		}
-		return &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: string(t)}
+		node := &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: string(t)}
+		if !yamlLexemeResolvesAsTag(string(t), tag) {
+			node.Style |= yaml.TaggedStyle
+		}
+		return node
 	case float64:
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: formatYAMLFloat(t)}
 	case int:
@@ -730,6 +823,137 @@ func logicalPatchPathSegments(start *yaml.Node, baseFromRoot, tokens []ptrToken)
 	return out, true
 }
 
+func scalarTagForOrderedValue(value interface{}) (string, bool) {
+	return scalarYAMLTag(value)
+}
+
+func markPatchScalarTagChange(st *docState, destinationPath []string, old *yaml.Node, value interface{}) {
+	if st == nil || len(destinationPath) == 0 || old == nil || old.Kind != yaml.ScalarNode {
+		return
+	}
+	newTag, ok := scalarTagForOrderedValue(value)
+	if ok && old.Tag != newTag {
+		setForcedScalarIntentLocked(st, destinationPath, newTag)
+	}
+}
+
+func markPatchSequenceScalarInsertion(st *docState, destinationPath []string, value interface{}) {
+	if st == nil || len(destinationPath) == 0 {
+		return
+	}
+	newTag, ok := scalarTagForOrderedValue(value)
+	if !ok {
+		return
+	}
+	// Consult the immutable source AST rather than the scalar byte index. The
+	// latter deliberately omits scalar items in mixed sequences, but an inserted
+	// scalar can still temporarily occupy an original custom-tagged index and
+	// later become its net replacement after another item is removed.
+	originalRoot := st.originalAST
+	if originalRoot != nil && originalRoot.Kind == yaml.DocumentNode && len(originalRoot.Content) == 1 {
+		originalRoot = originalRoot.Content[0]
+	}
+	original, exists := yamlNodeAtPathSegments(originalRoot, destinationPath)
+	if exists && original.Kind == yaml.ScalarNode && original.Tag != newTag {
+		setForcedScalarIntentLocked(st, destinationPath, newTag)
+	}
+}
+
+func clearForcedScalarIntentAtOrBelow(st *docState, path []string) {
+	if st == nil || len(path) == 0 {
+		return
+	}
+	for encoded := range st.forceScalarRewrite {
+		segments, ok := splitJoinedPath(encoded)
+		if ok && len(segments) >= len(path) && pathSegmentsEqual(segments[:len(path)], path) {
+			delete(st.forceScalarRewrite, encoded)
+			delete(st.forceScalarTags, encoded)
+		}
+	}
+}
+
+func rebaseForcedScalarIntentsForSequence(st *docState, sequencePath []string, index, delta int, removeIndex bool) {
+	if st == nil || len(st.forceScalarRewrite) == 0 {
+		return
+	}
+	rebased := make(map[string]struct{}, len(st.forceScalarRewrite))
+	tags := make(map[string]string, len(st.forceScalarTags))
+	for encoded := range st.forceScalarRewrite {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok || len(segments) <= len(sequencePath) || !pathSegmentsEqual(segments[:len(sequencePath)], sequencePath) ||
+			!isIndexPathSegment(segments[len(sequencePath)]) {
+			rebased[encoded] = struct{}{}
+			tags[encoded] = st.forceScalarTags[encoded]
+			continue
+		}
+		itemIndex, err := strconv.Atoi(segments[len(sequencePath)][1 : len(segments[len(sequencePath)])-1])
+		if err != nil || removeIndex && itemIndex == index {
+			if err != nil {
+				rebased[encoded] = struct{}{}
+				tags[encoded] = st.forceScalarTags[encoded]
+			}
+			continue
+		}
+		if itemIndex > index || (!removeIndex && itemIndex >= index) {
+			segments[len(sequencePath)] = indexSeg(itemIndex + delta)
+			newEncoded := joinPath(segments)
+			rebased[newEncoded] = struct{}{}
+			tags[newEncoded] = st.forceScalarTags[encoded]
+			continue
+		}
+		rebased[encoded] = struct{}{}
+		tags[encoded] = st.forceScalarTags[encoded]
+	}
+	st.forceScalarRewrite = rebased
+	st.forceScalarTags = tags
+}
+
+func rebaseNodeRewriteIntentsForSequence(st *docState, sequencePath []string, index, delta int, removeIndex, removalLeavesVacancy bool) {
+	if st == nil || len(st.nodeRewriteIntents) == 0 {
+		return
+	}
+	rebased := make(map[string]nodeRewriteIntent, len(st.nodeRewriteIntents))
+	for encoded, intent := range st.nodeRewriteIntents {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok || len(segments) <= len(sequencePath) || !pathSegmentsEqual(segments[:len(sequencePath)], sequencePath) ||
+			!isIndexPathSegment(segments[len(sequencePath)]) {
+			rebased[encoded] = intent
+			continue
+		}
+		itemIndex, err := strconv.Atoi(segments[len(sequencePath)][1 : len(segments[len(sequencePath)])-1])
+		if err != nil {
+			rebased[encoded] = intent
+			continue
+		}
+		if removeIndex && itemIndex == index {
+			// A tombstone belongs only to a genuinely vacant sequence slot (a
+			// removal at the end). When a successor shifts into this index, that
+			// live item's rebased history must own the path; retaining the removed
+			// item's tombstone here creates a map-key collision and can
+			// nondeterministically discard the live tag-rewrite intent.
+			if !removalLeavesVacancy {
+				continue
+			}
+			intent.target = yamlNodeSignature{}
+			// Preserve an explicit tombstone even when this path was previously
+			// created during the same edit history. A subsequent add at the same
+			// index is a replacement of the original source occupant for output
+			// purposes, not a fresh insertion that may reuse its custom tag.
+			if !intent.origin.exists {
+				intent.origin = yamlNodeSignature{exists: true}
+			}
+			rebased[encoded] = intent
+			continue
+		}
+		if itemIndex > index || (!removeIndex && itemIndex >= index) {
+			segments[len(sequencePath)] = indexSeg(itemIndex + delta)
+			encoded = joinPath(segments)
+		}
+		rebased[encoded] = intent
+	}
+	st.nodeRewriteIntents = rebased
+}
+
 // --- Operations ---
 
 func opTest(start *yaml.Node, tokens []ptrToken, expectRaw json.RawMessage) error {
@@ -827,6 +1051,11 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []ptrToken
 					return fmt.Errorf("yamledit: add: update ordered array: %w", updateErr)
 				}
 				st.ordered = updated
+				if hasDestinationPath {
+					recordNodeReplacementIntentLocked(st, destinationPath, nil, signatureOfYAMLNode(yval))
+					markPatchSequenceScalarInsertion(st, destinationPath, orderedVal)
+					recordShiftedSubtreeIntentsLocked(st, destinationPath, yval)
+				}
 			}
 			return nil
 		}
@@ -834,6 +1063,12 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []ptrToken
 		// Insert at index
 		if last.index < 0 || last.index > len(parent.Content) {
 			return fmt.Errorf("yamledit: add: index %d out of bounds", last.index)
+		}
+		var insertionOrigin *yaml.Node
+		if st != nil && hasDestinationPath {
+			if encoded := joinPath(destinationPath); st.nodeRewriteIntents[encoded].origin.exists {
+				insertionOrigin = parent.Content[last.index]
+			}
 		}
 		parent.Content = append(parent.Content, nil)
 		copy(parent.Content[last.index+1:], parent.Content[last.index:])
@@ -849,6 +1084,15 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []ptrToken
 			st.ordered = updated
 			if hasDestinationPath && len(destinationPath) > 0 {
 				rebaseDeletionMarkersForSequence(st, destinationPath[:len(destinationPath)-1], last.index, 1, false)
+				rebaseForcedScalarIntentsForSequence(st, destinationPath[:len(destinationPath)-1], last.index, 1, false)
+				rebaseNodeRewriteIntentsForSequence(st, destinationPath[:len(destinationPath)-1], last.index, 1, false, false)
+				recordNodeReplacementIntentLocked(st, destinationPath, insertionOrigin, signatureOfYAMLNode(yval))
+				markPatchSequenceScalarInsertion(st, destinationPath, orderedVal)
+				sequencePath := destinationPath[:len(destinationPath)-1]
+				for itemIndex := last.index; itemIndex < len(parent.Content); itemIndex++ {
+					itemPath := append(append([]string(nil), sequencePath...), indexSeg(itemIndex))
+					recordShiftedSubtreeIntentsLocked(st, itemPath, parent.Content[itemIndex])
+				}
 			}
 		}
 		return nil
@@ -859,6 +1103,17 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []ptrToken
 	// ---------------------------------------------------------------------
 	if parent.Kind != yaml.MappingNode {
 		return errors.New("yamledit: add: parent is not a mapping")
+	}
+	var oldScalar *yaml.Node
+	for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+		if isStringMappingKey(parent.Content[i], last.key) {
+			oldScalar = parent.Content[i+1]
+			break
+		}
+	}
+	if hasDestinationPath {
+		markPatchScalarTagChange(st, destinationPath, oldScalar, orderedVal)
+		recordNodeReplacementIntentLocked(st, destinationPath, oldScalar, signatureOfYAMLNode(yval))
 	}
 
 	// Update AST:
@@ -873,6 +1128,14 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []ptrToken
 			tag = "!!float"
 		}
 		upsertScalarKey(parent, last.key, tag, string(vv))
+		if !yamlLexemeResolvesAsTag(string(vv), tag) {
+			for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+				if isStringMappingKey(parent.Content[i], last.key) {
+					parent.Content[i+1].Style |= yaml.TaggedStyle
+					break
+				}
+			}
+		}
 	case float64:
 		upsertScalarKey(parent, last.key, "!!float", formatYAMLFloat(vv))
 	case bool:
@@ -944,15 +1207,6 @@ func opAdd(start *yaml.Node, st *docState, docHN *yaml.Node, basePath []ptrToken
 			clearDeletionMarkersAtOrBelow(st, destinationPath)
 		}
 
-		// Any add that traverses an array index generally requires structural rewrite support,
-		// because inserting new keys inside sequence items cannot be done with pure token surgery
-		// unless you have precise bounds/insertion logic.
-		for _, tk := range absTokens {
-			if tk.isIdx {
-				st.structuralDirty = true
-				break
-			}
-		}
 	}
 
 	return nil
@@ -978,6 +1232,8 @@ func opRemove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []p
 			return fmt.Errorf("yamledit: remove: index %d out of bounds", last.index)
 		}
 		target := parent.Content[last.index]
+		removalLeavesVacancy := last.index == len(parent.Content)-1
+		removedNodeHasIntent := hasRemovedPath && hasNodeRewriteIntentAtOrBelow(st, removedPath)
 		if removalWouldBreakAlias(patchAliasScanRoot(start, docHN), target) {
 			return errors.New("yamledit: remove: value defines an anchor that is still referenced")
 		}
@@ -991,6 +1247,17 @@ func opRemove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []p
 			}
 			if hasRemovedPath && len(removedPath) > 0 {
 				rebaseDeletionMarkersForSequence(st, removedPath[:len(removedPath)-1], last.index, -1, true)
+				rebaseForcedScalarIntentsForSequence(st, removedPath[:len(removedPath)-1], last.index, -1, true)
+				rebaseNodeRewriteIntentsForSequence(st, removedPath[:len(removedPath)-1], last.index, -1, true, removalLeavesVacancy)
+				if !removalLeavesVacancy {
+					sequencePath := removedPath[:len(removedPath)-1]
+					for itemIndex := last.index; itemIndex < len(parent.Content); itemIndex++ {
+						itemPath := append(append([]string(nil), sequencePath...), indexSeg(itemIndex))
+						recordShiftedSubtreeIntentsLocked(st, itemPath, parent.Content[itemIndex])
+					}
+				} else if !removedNodeHasIntent {
+					recordNodeRemovalIntentLocked(st, removedPath, target)
+				}
 			}
 		}
 		return nil
@@ -999,11 +1266,13 @@ func opRemove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []p
 		return errors.New("yamledit: remove: parent is not a mapping")
 	}
 	found := false
+	var retainedOld *yaml.Node
 	targets := make([]*yaml.Node, 0, 2)
 	content := make([]*yaml.Node, 0, len(parent.Content))
 	for i := 0; i+1 < len(parent.Content); i += 2 {
 		if isStringMappingKey(parent.Content[i], last.key) {
 			found = true
+			retainedOld = parent.Content[i+1]
 			targets = append(targets, parent.Content[i], parent.Content[i+1])
 			continue
 		}
@@ -1015,6 +1284,9 @@ func opRemove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []p
 	if removalWouldBreakAlias(patchAliasScanRoot(start, docHN), targets...) {
 		return errors.New("yamledit: remove: member contains an anchor that is still referenced")
 	}
+	if st != nil && hasRemovedPath {
+		recordNodeRemovalIntentLocked(st, removedPath, retainedOld)
+	}
 	parent.Content = content
 	if st != nil {
 		absTokens := appendPathTokens(baseFromRoot, tokens)
@@ -1022,6 +1294,9 @@ func opRemove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []p
 		st.ordered, updateErr = orderedRemoveAtPathTokens(st.ordered, absTokens)
 		if updateErr != nil {
 			return fmt.Errorf("yamledit: remove: update ordered map: %w", updateErr)
+		}
+		if hasRemovedPath {
+			clearForcedScalarIntentAtOrBelow(st, removedPath)
 		}
 	}
 	return nil
@@ -1062,6 +1337,10 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 			return fmt.Errorf("yamledit: replace: index %d out of bounds", last.index)
 		}
 		old := parent.Content[last.index]
+		if hasDestinationPath {
+			markPatchScalarTagChange(st, destinationPath, old, orderedVal)
+			recordNodeReplacementIntentLocked(st, destinationPath, old, signatureOfYAMLNode(yval))
+		}
 		if old != nil {
 			yval.HeadComment = old.HeadComment
 			yval.LineComment = old.LineComment
@@ -1102,6 +1381,17 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 	if !foundKey {
 		return fmt.Errorf("yamledit: replace: key %q not found", last.key)
 	}
+	var oldScalar *yaml.Node
+	for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+		if isStringMappingKey(parent.Content[i], last.key) {
+			oldScalar = parent.Content[i+1]
+			break
+		}
+	}
+	if hasDestinationPath {
+		markPatchScalarTagChange(st, destinationPath, oldScalar, orderedVal)
+		recordNodeReplacementIntentLocked(st, destinationPath, oldScalar, signatureOfYAMLNode(yval))
+	}
 	// choose surgical replacements for scalars
 	switch vv := orderedVal.(type) {
 	case int:
@@ -1112,6 +1402,14 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 			tag = "!!float"
 		}
 		upsertScalarKey(parent, last.key, tag, string(vv))
+		if !yamlLexemeResolvesAsTag(string(vv), tag) {
+			for i := len(parent.Content) - 2; i >= 0; i -= 2 {
+				if isStringMappingKey(parent.Content[i], last.key) {
+					parent.Content[i+1].Style |= yaml.TaggedStyle
+					break
+				}
+			}
+		}
 	case float64:
 		upsertScalarKey(parent, last.key, "!!float", formatYAMLFloat(vv))
 	case bool:
@@ -1332,9 +1630,18 @@ func resolveParentForAddValidationAfterRemoval(start *yaml.Node, tokens []ptrTok
 }
 
 func opCopy(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []ptrToken, fromToks, toToks []ptrToken) error {
-	src, err := nodeAtPatchPath(start, fromToks, "copy")
-	if err != nil {
-		return err
+	// The empty JSON Pointer names the current document value. Copying that
+	// value to a non-root destination is well-defined by RFC 6902: capture the
+	// value before add mutates the destination. Keep nodeAtPatchPath's empty-path
+	// rejection for move, whose root-source semantics are intentionally outside
+	// this package's mapping-root model.
+	src := start
+	if len(fromToks) != 0 {
+		var err error
+		src, err = nodeAtPatchPath(start, fromToks, "copy")
+		if err != nil {
+			return err
+		}
 	}
 	if yamlNodeHasNonJSONType(src) {
 		return errors.New("yamledit: copy: source is not JSON-compatible")
@@ -1434,7 +1741,7 @@ func deepEqual(a, b interface{}) bool {
 type normalizedDecimal struct {
 	negative bool
 	digits   string
-	scale    int64
+	scale    string
 }
 
 func canonicalDecimal(v interface{}) (normalizedDecimal, bool) {
@@ -1481,18 +1788,16 @@ func normalizeDecimalNumber(s string) (normalizedDecimal, bool) {
 		negative = s[0] == '-'
 		s = s[1:]
 	}
-	var exponent int64
+	var exponent big.Int
 	if pos := strings.IndexAny(s, "eE"); pos >= 0 {
-		parsed, err := strconv.ParseInt(s[pos+1:], 10, 64)
-		if err != nil {
+		if _, ok := exponent.SetString(s[pos+1:], 10); !ok {
 			return normalizedDecimal{}, false
 		}
-		exponent = parsed
 		s = s[:pos]
 	}
-	var fractionDigits int64
+	var fractionDigits int
 	if dot := strings.IndexByte(s, '.'); dot >= 0 {
-		fractionDigits = int64(len(s) - dot - 1)
+		fractionDigits = len(s) - dot - 1
 		s = s[:dot] + s[dot+1:]
 	}
 	if s == "" {
@@ -1505,22 +1810,22 @@ func normalizeDecimalNumber(s string) (normalizedDecimal, bool) {
 	}
 	s = strings.TrimLeft(s, "0")
 	if s == "" {
-		return normalizedDecimal{digits: "0"}, true
+		return normalizedDecimal{digits: "0", scale: "0"}, true
 	}
-	trailing := int64(len(s) - len(strings.TrimRight(s, "0")))
+	trailing := len(s) - len(strings.TrimRight(s, "0"))
 	if trailing > 0 {
-		s = s[:len(s)-int(trailing)]
+		s = s[:len(s)-trailing]
 	}
-	// Check both arithmetic steps for overflow without allocating a power of ten.
-	if fractionDigits > 0 && exponent < -1*(1<<63)+fractionDigits {
-		return normalizedDecimal{}, false
-	}
-	scale := exponent - fractionDigits
-	if trailing > 0 && scale > (1<<63)-1-trailing {
-		return normalizedDecimal{}, false
-	}
-	scale += trailing
-	return normalizedDecimal{negative: negative, digits: s, scale: scale}, true
+	// JSON permits an exponent with any number of digits. Keep the normalized
+	// decimal scale at arbitrary precision as well, otherwise mathematically
+	// equal inputs stop comparing equal at the int64 exponent boundary.
+	var scale, adjustment big.Int
+	scale.Set(&exponent)
+	adjustment.SetInt64(int64(fractionDigits))
+	scale.Sub(&scale, &adjustment)
+	adjustment.SetInt64(int64(trailing))
+	scale.Add(&scale, &adjustment)
+	return normalizedDecimal{negative: negative, digits: s, scale: scale.String()}, true
 }
 
 // --- Ordered updates for arrays (best-effort for fallback encoder) ---

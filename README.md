@@ -55,7 +55,7 @@ func main() {
 	yamledit.SetScalarInt(env, "PORT", 9090)
 	yamledit.SetScalarBool(env, "METRICS_ENABLED", true)
 	yamledit.SetScalarString(env, "GREETING", "hi") // keeps prior quote style if it existed
-	yamledit.SetScalarNull(env, "DEPRECATED")       // !!null
+	yamledit.SetScalarNull(env, "OPTIONAL_VALUE")   // !!null
 
 	// 4) Delete keys surgically (removes full blocks, including arrays)
 	yamledit.DeleteKey(env, "OLD_FLAG")
@@ -143,11 +143,11 @@ env:
   written as YAML integers; `float32`/`float64` remain YAML floats even when integral; valid `json.Number` values retain
   their numeric category and spelling. Empty slices and maps are written as `[]` and `{}`. A `nil` value deletes the
   key. A `map[string]any` is a complete replacement; use `SetMapValues` when you want to merge individual fields into
-  an existing mapping. Cyclic, excessively deep, or oversized caller collections are bounded; because this setter has
-  no error return, an unrepresentable branch is emitted as a quoted diagnostic string rather than recursed indefinitely.
+  an existing mapping. Unsupported types and cyclic, excessively deep, or oversized caller collections are bounded;
+  because this setter has no error return, an unrepresentable branch is emitted as a quoted diagnostic string.
 
 * `SetMapValues(mapNode *yaml.Node, fields map[string]any, opts SetValueOptions)`
-  Writes multiple arbitrary values into a mapping node.
+  Writes multiple `SetValue`-supported values into a mapping node.
 
 * `SetStringMapValues(mapNode *yaml.Node, fields map[string]string, opts SetValueOptions)`
   Writes multiple string values into a mapping node.
@@ -223,10 +223,10 @@ out, _ := yamledit.Marshal(doc)
   **last** occurrence remains (YAML semantics: last wins). Duplicates in source forms that cannot be bounded safely are
   preserved rather than risking removal of neighboring content.
 * **Booleans normalize on edit.** A key you edit with `SetScalarBool` (or via JSON Patch) will render as bare `true`/
-  `false` even if previously quoted. Unrelated booleans remain untouched.
-* **Implicit empty maps materialize.** An untagged blank mapping value such as `config:` is treated as an empty mapping
-  and may marshal as `config: {}`. If materializing it inside flow YAML would discard source-only metadata that cannot
-  be reproduced safely, `Marshal` returns an error.
+  `false` even when its source token is quoted. Unrelated booleans remain untouched.
+* **Implicit nulls stay null.** An untagged blank mapping value such as `config:` remains a YAML null and is byte-stable
+  across a no-op parse/marshal cycle. `EnsurePath` explicitly converts it to a mapping when a caller asks to traverse
+  or populate that path.
 * **No global re‑encode for package edits.** Mutations made through `EnsurePath`, setters, `DeleteKey`, or JSON Patch use
   surgery or per-key/sequence rewrites based on recorded bounds. If those are unsafe, `Marshal` returns an error.
   Direct field changes to the returned `yaml.Node` are the exception: because they bypass the edit index, `Marshal`
@@ -290,6 +290,5 @@ structural and sequence replacement, multi-operation JSON Patch, and wide mappin
 
 ## License
 
-The README historically identified this project as MIT-licensed, but the
-repository does not yet contain a `LICENSE` file. The maintainer must confirm
-the license text and copyright notice before a release is published.
+The repository does not yet contain a `LICENSE` file. The maintainer must
+select the license text and copyright notice before a release is published.

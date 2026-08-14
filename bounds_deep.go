@@ -27,55 +27,6 @@ func indexBoundsByPathKeyDeep(original []byte, doc *yaml.Node) (map[string][]kvB
 	return out, unsafe, opaque
 }
 
-// indexNonReproduciblePaths records addressable regions containing source
-// syntax that yaml.v3 resolves into ordinary Node fields but cannot emit again.
-// Keep this separate from opaque paths: live-AST rewriting is exactly what makes
-// most opaque presentation safe, whereas a bare non-specific `!` property is
-// absent from the live graph and must block automatic ancestor promotion.
-func indexNonReproduciblePaths(original []byte, doc *yaml.Node) map[string]struct{} {
-	root := doc
-	if root != nil && root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
-		root = root.Content[0]
-	}
-	lineOffsets := buildLineOffsets(original)
-	paths := make(map[string]struct{})
-	mark := func(path []string) {
-		for depth := 1; depth <= len(path); depth++ {
-			paths[joinPath(path[:depth])] = struct{}{}
-		}
-	}
-	var walk func(*yaml.Node, []string)
-	walk = func(node *yaml.Node, path []string) {
-		if node == nil {
-			return
-		}
-		if nodeHasNonSpecificTag(original, lineOffsets, node) {
-			mark(path)
-		}
-		switch node.Kind {
-		case yaml.MappingNode:
-			for index := 0; index+1 < len(node.Content); index += 2 {
-				key, value := node.Content[index], node.Content[index+1]
-				if key == nil || key.Kind != yaml.ScalarNode {
-					continue
-				}
-				childPath := append(append([]string(nil), path...), key.Value)
-				if nodeHasNonSpecificTag(original, lineOffsets, key) {
-					mark(childPath)
-				}
-				walk(value, childPath)
-			}
-		case yaml.SequenceNode:
-			for index, child := range node.Content {
-				childPath := append(append([]string(nil), path...), indexSeg(index))
-				walk(child, childPath)
-			}
-		}
-	}
-	walk(root, nil)
-	return paths
-}
-
 func walkBoundsDeep(original []byte, lineOffsets []int, node *yaml.Node, prefix []string, out map[string][]kvBounds, unsafe, opaque map[string]struct{}, inheritedUnsafe, insideFlow bool) {
 	if node == nil {
 		return
@@ -374,12 +325,6 @@ func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode, valueNod
 		start = 3
 	}
 	keyIndent := keyNode.Column - 1 // important for "- key: ..." cases
-	// normalizeImplicitMaps represents a bare `key:` as an empty block-style
-	// mapping. It has no source subtree of its own, so an indented standalone
-	// comment after the key must not be swallowed when the bare token is rewritten
-	// to `{}`. yaml.v3 commonly attaches that comment to the following key.
-	implicitEmptyMap := valueNode != nil && valueNode.Kind == yaml.MappingNode &&
-		len(valueNode.Content) == 0 && valueNode.Style&yaml.FlowStyle == 0
 	// Indentation normally identifies the next sibling, but YAML permits quoted
 	// scalars and flow collections to continue at any column. A continuation such
 	// as the second line below is still part of `value`, even though it begins at
@@ -413,7 +358,7 @@ func boundsForMappingEntry(original []byte, lineOffsets []int, keyNode, valueNod
 			// A same/less-indented standalone comment is safer to associate with
 			// the following sibling (or document footer), not the key being
 			// deleted. More-indented comments remain inside this key's subtree.
-			if implicitEmptyMap || countLeadingIndent(raw) <= keyIndent {
+			if countLeadingIndent(raw) <= keyIndent {
 				end = lineStart
 				break
 			}

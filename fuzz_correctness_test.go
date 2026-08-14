@@ -22,9 +22,9 @@ const (
 )
 
 // FuzzParseMarshalNoop exercises the broad parser surface independently of the
-// mutators. Ordinary source must be byte-stable; documented duplicate-key and
-// implicit-map normalization is checked semantically. Marshal must never
-// mutate the caller's AST. Empty input synthesizes an empty mapping.
+// mutators. Ordinary source must be byte-stable; documented duplicate-key
+// cleanup is checked semantically. Marshal must never mutate the caller's AST.
+// Empty input synthesizes an empty mapping.
 func FuzzParseMarshalNoop(f *testing.F) {
 	seeds := [][]byte{
 		nil,
@@ -38,7 +38,8 @@ func FuzzParseMarshalNoop(f *testing.F) {
 		[]byte("base: &base {x: 1, nested: [a, b]}\nalias: *base\n"),
 		[]byte("first: &shared\n  value: one\nsecond:\n  copy: *shared\n"),
 		[]byte("duplicate: one # first\nduplicate: two # second\ntail: keep\n"),
-		// yaml.v3 and goccy historically disagreed on this compact spelling;
+		[]byte("#0\nA:\nA:"),
+		// yaml.v3 and goccy can disagree on this compact spelling;
 		// the returned yaml.Node must remain the authoritative interpretation.
 		[]byte("A: {0:}"),
 		[]byte("A: &0000 {0:}"),
@@ -69,16 +70,15 @@ func FuzzParseMarshalNoop(f *testing.F) {
 			t.Fatal("no-op Marshal mutated the parsed YAML graph")
 		}
 		if err != nil {
-			// Parse intentionally materializes implicit empty mapping values and
-			// safely collapses duplicate keys. Some exotic layouts have no scoped
-			// byte rewrite for that normalization; the documented explicit error is
-			// acceptable, whereas an ordinary no-op document must always marshal.
-			if fuzzSourceMayNormalize(source) {
+			// Marshal safely collapses duplicate keys. Some exotic layouts have no
+			// scoped byte rewrite for that cleanup; the explicit error is acceptable,
+			// whereas an ordinary no-op document must always marshal.
+			if fuzzSourceMayDedupe(source) {
 				return
 			}
 			t.Fatalf("Parse accepted input that no-op Marshal rejected: %v\ninput:\n%q", err, source)
 		}
-		if len(source) != 0 && !fuzzSourceMayNormalize(source) && !bytes.Equal(out, source) {
+		if len(source) != 0 && !fuzzSourceMayDedupe(source) && !bytes.Equal(out, source) {
 			t.Fatalf("no-op Marshal changed source bytes\ninput:  %q\noutput: %q", source, out)
 		}
 
@@ -86,7 +86,7 @@ func FuzzParseMarshalNoop(f *testing.F) {
 		if err != nil {
 			t.Fatalf("Marshal produced YAML that Parse rejected: %v\noutput:\n%q", err, out)
 		}
-		assertFuzzGraphMatch(t, doc, roundTrip, sourceGraph, fuzzSourceMayNormalize(source), "no-op Marshal", out)
+		assertFuzzGraphMatch(t, doc, roundTrip, sourceGraph, fuzzSourceMayDedupe(source), "no-op Marshal", out)
 		second, err := Marshal(roundTrip)
 		if err != nil {
 			t.Fatalf("second no-op Marshal failed: %v\noutput:\n%q", err, out)
@@ -107,6 +107,7 @@ func FuzzJSONPatchAtomicAndSemantic(f *testing.F) {
 		patch string
 	}{
 		{"a: 1\nitems: [one, two]\n", `[]`},
+		{"base: {x: 0,A}", `[{"op":"replace","path":"/base/x","value":1}]`},
 		{"a: 1\nitems: [one, two]\n", `[{"op":"replace","path":"/a","value":1.0}]`},
 		{"a: 1\nitems: [one, two]\n", `[{"op":"add","path":"/items/-","value":{"nested":true}}]`},
 		{"a: 1\nitems: [one, two]\n", `[{"op":"move","from":"/items/0","path":"/items/1"}]`},
@@ -177,19 +178,19 @@ func FuzzJSONPatchAtomicAndSemantic(f *testing.F) {
 				t.Fatal("Marshal mutated the graph after a failed JSON Patch")
 			}
 			if marshalErr != nil {
-				if fuzzSourceMayNormalize(source) {
+				if fuzzSourceMayDedupe(source) {
 					return
 				}
 				t.Fatalf("failed JSON Patch left the document unmarshalable: patch error: %v; marshal error: %v", err, marshalErr)
 			}
-			if len(source) != 0 && !fuzzSourceMayNormalize(source) && !bytes.Equal(out, source) {
+			if len(source) != 0 && !fuzzSourceMayDedupe(source) && !bytes.Equal(out, source) {
 				t.Fatalf("failed JSON Patch changed source bytes\npatch:  %q\ninput:  %q\noutput: %q", patchBytes, source, out)
 			}
 			roundTrip, parseErr := Parse(out)
 			if parseErr != nil {
 				t.Fatalf("failed JSON Patch produced unparsable no-op output: %v\noutput: %q", parseErr, out)
 			}
-			assertFuzzGraphMatch(t, before, roundTrip, sourceGraph, fuzzSourceMayNormalize(source), "failed JSON Patch", out)
+			assertFuzzGraphMatch(t, before, roundTrip, sourceGraph, fuzzSourceMayDedupe(source), "failed JSON Patch", out)
 			return
 		}
 
@@ -218,7 +219,7 @@ func FuzzJSONPatchAtomicAndSemantic(f *testing.F) {
 		if parseErr != nil {
 			t.Fatalf("patched output cannot be parsed: %v\noutput:\n%q", parseErr, out)
 		}
-		assertFuzzGraphMatch(t, beforeMarshal, roundTrip, before, fuzzSourceMayNormalize(source), "successful JSON Patch", out)
+		assertFuzzGraphMatch(t, beforeMarshal, roundTrip, before, fuzzSourceMayDedupe(source), "successful JSON Patch", out)
 	})
 }
 
@@ -361,32 +362,33 @@ func fuzzDecodeSourceGraph(source []byte) *yaml.Node {
 //   - earlier duplicate string-key occurrences may be removed (last wins);
 //   - nodes changed since sourceGraph may acquire an emitter-chosen scalar style
 //     or lose parser coordinates, while untouched nodes must retain presentation.
-func assertFuzzGraphMatch(t *testing.T, wantDoc, gotDoc, sourceGraph *yaml.Node, allowNormalizationStyle bool, context string, output []byte) {
+func assertFuzzGraphMatch(t *testing.T, wantDoc, gotDoc, sourceGraph *yaml.Node, allowDuplicateCleanupStyle bool, context string, output []byte) {
 	t.Helper()
-	if ok, reason := fuzzYAMLGraphEqual(wantDoc, gotDoc, sourceGraph, allowNormalizationStyle); !ok {
+	if ok, reason := fuzzYAMLGraphEqual(wantDoc, gotDoc, sourceGraph, allowDuplicateCleanupStyle); !ok {
 		t.Fatalf("%s changed YAML graph during Marshal: %s\noutput:\n%q", context, reason, output)
 	}
 }
 
-func fuzzYAMLGraphEqual(wantDoc, gotDoc, sourceGraph *yaml.Node, allowNormalizationStyle bool) (bool, string) {
+func fuzzYAMLGraphEqual(wantDoc, gotDoc, sourceGraph *yaml.Node, allowDuplicateCleanupStyle bool) (bool, string) {
 	type comparison struct {
 		want             *yaml.Node
 		got              *yaml.Node
 		path             string
 		allowStyleChange bool
 	}
-	stack := []comparison{{want: wantDoc, got: gotDoc, path: "$", allowStyleChange: allowNormalizationStyle}}
+	stack := []comparison{{want: wantDoc, got: gotDoc, path: "$", allowStyleChange: allowDuplicateCleanupStyle}}
 	wantToGot := make(map[*yaml.Node]*yaml.Node)
 	gotToWant := make(map[*yaml.Node]*yaml.Node)
 	sourceNodes := fuzzIndexSourceNodes(sourceGraph)
-	wantComments := make(map[string]int)
-	gotComments := make(map[string]int)
-	addComments := func(comments map[string]int, node *yaml.Node) {
-		for _, comment := range []string{node.HeadComment, node.LineComment, node.FootComment} {
-			if comment != "" {
-				comments[strings.TrimRight(comment, " \t\r")]++
-			}
-		}
+	var requiredComments, allowedComments, gotComments map[string]int
+	if allowDuplicateCleanupStyle {
+		// Duplicate cleanup removes earlier entries, including comments owned by
+		// those entries, but a leading/source comment can be reattached to the
+		// retained occurrence by the parser. Require comments on retained nodes and
+		// permit any other source comment to survive; never permit a new one.
+		requiredComments = make(map[string]int)
+		allowedComments = fuzzCommentMultiset(wantDoc)
+		gotComments = fuzzCommentMultiset(gotDoc)
 	}
 	for len(stack) > 0 {
 		last := len(stack) - 1
@@ -414,9 +416,12 @@ func fuzzYAMLGraphEqual(wantDoc, gotDoc, sourceGraph *yaml.Node, allowNormalizat
 		if want.Kind != got.Kind || want.Tag != got.Tag || want.Value != got.Value || want.Anchor != got.Anchor {
 			return false, fmt.Sprintf("%s: node mismatch want(kind=%d tag=%q value=%q anchor=%q) got(kind=%d tag=%q value=%q anchor=%q)", current.path, want.Kind, want.Tag, want.Value, want.Anchor, got.Kind, got.Tag, got.Value, got.Anchor)
 		}
-		if allowNormalizationStyle {
-			addComments(wantComments, want)
-			addComments(gotComments, got)
+		if allowDuplicateCleanupStyle {
+			for _, comment := range []string{want.HeadComment, want.LineComment, want.FootComment} {
+				if comment != "" {
+					requiredComments[strings.TrimRight(comment, " \t\r")]++
+				}
+			}
 		} else if want.HeadComment != got.HeadComment || want.LineComment != got.LineComment || want.FootComment != got.FootComment {
 			return false, current.path + ": comments changed"
 		}
@@ -455,17 +460,47 @@ func fuzzYAMLGraphEqual(wantDoc, gotDoc, sourceGraph *yaml.Node, allowNormalizat
 			})
 		}
 	}
-	if allowNormalizationStyle {
-		if len(wantComments) != len(gotComments) {
-			return false, "comment set changed during source normalization"
+	if allowDuplicateCleanupStyle {
+		for comment, count := range requiredComments {
+			if gotComments[comment] < count {
+				return false, "comment on retained node was lost during duplicate cleanup"
+			}
 		}
-		for comment, count := range wantComments {
-			if gotComments[comment] != count {
-				return false, "comment set changed during source normalization"
+		for comment, count := range gotComments {
+			if allowedComments[comment] < count {
+				return false, "comment was added or duplicated during duplicate cleanup"
 			}
 		}
 	}
 	return true, ""
+}
+
+func fuzzCommentMultiset(root *yaml.Node) map[string]int {
+	comments := make(map[string]int)
+	seen := make(map[*yaml.Node]struct{})
+	stack := []*yaml.Node{root}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		node := stack[last]
+		stack = stack[:last]
+		if node == nil {
+			continue
+		}
+		if _, exists := seen[node]; exists {
+			continue
+		}
+		seen[node] = struct{}{}
+		for _, comment := range []string{node.HeadComment, node.LineComment, node.FootComment} {
+			if comment != "" {
+				comments[strings.TrimRight(comment, " \t\r")]++
+			}
+		}
+		stack = append(stack, node.Content...)
+		if node.Alias != nil {
+			stack = append(stack, node.Alias)
+		}
+	}
+	return comments
 }
 
 type fuzzSourcePosition struct {
@@ -680,16 +715,14 @@ func fuzzPatchOracleComparable(patchJSON []byte) bool {
 	return decoder.Decode(&trailing) == io.EOF
 }
 
-// fuzzSourceMayNormalize mirrors the two documented no-op exceptions for
-// parsed sources: duplicate mapping keys are collapsed with last-key-wins
-// semantics, and implicit empty mapping values are materialized as {}. Even in
-// these cases the caller still gets a semantic round-trip assertion above.
-func fuzzSourceMayNormalize(source []byte) bool {
+// fuzzSourceMayDedupe identifies the sole no-op exception: duplicate mapping
+// keys may be collapsed with last-key-wins semantics. Even then the caller gets
+// a semantic round-trip assertion above.
+func fuzzSourceMayDedupe(source []byte) bool {
 	var document yaml.Node
 	if err := decodeSingleYAMLDocument(source, &document); err != nil || len(document.Content) != 1 || document.Content[0] == nil {
 		return false
 	}
-	lineOffsets := buildLineOffsets(source)
 	visiting := make(map[*yaml.Node]bool)
 	var walk func(*yaml.Node) bool
 	walk = func(node *yaml.Node) bool {
@@ -714,12 +747,6 @@ func fuzzSourceMayNormalize(source []byte) bool {
 						return true
 					}
 					seen[key.Value] = struct{}{}
-				}
-				if (node.Tag == "" || node.Tag == "!!map") && key != nil && key.Kind == yaml.ScalarNode &&
-					key.Tag == "!!str" && value != nil && value.Kind == yaml.ScalarNode &&
-					value.Tag == "!!null" && value.Value == "" && value.Anchor == "" &&
-					!scalarHasExplicitTag(source, lineOffsets, value) {
-					return true
 				}
 				if walk(key) || walk(value) {
 					return true

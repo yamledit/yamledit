@@ -187,10 +187,6 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	for path := range st.opaquePathKeys {
 		semanticOpaquePaths[path] = struct{}{}
 	}
-	nonReproduciblePaths := make(map[string]struct{}, len(st.nonReproduciblePathKeys))
-	for path := range st.nonReproduciblePathKeys {
-		nonReproduciblePaths[path] = struct{}{}
-	}
 	opaquePaths := make(map[string]struct{}, len(semanticOpaquePaths))
 	for path := range semanticOpaquePaths {
 		opaquePaths[path] = struct{}{}
@@ -207,7 +203,6 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	delSet := make(map[string]struct{}, len(st.toDelete))
 	forceScalarRewrite := make(map[string]struct{}, len(st.forceScalarRewrite))
 	nodeRewriteTargets := activeNodeRewriteIntentsLocked(st, doc.Content[0])
-	normalizationRewriteTargets := activeAutomaticNormalizationIntentsLocked(st, nodeRewriteTargets)
 	mappingReinsertions := activeMappingReinsertionsLocked(st, doc.Content[0])
 	seqIdx := cloneSeqIndex(st.seqIndex)
 	for k := range st.toDelete {
@@ -248,13 +243,13 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 			return validated, nil
 		}
 		// A conservative byte patch can still prove incomplete when several
-		// mutations interact. Do not let a historical "structural dirty" bit
+		// mutations interact. Do not let a stale "structural dirty" bit
 		// decide forever whether surgery is usable; validate the actual candidate
 		// and, when it fails, give the scoped structural renderer a chance.
 		surgicalValidationErr = err
 	}
 
-	if patched, ok := structuralRewrite(original, ordered, origOrdered, liveRootSnapshot, boundsIdx, unsafePaths, opaquePaths, nonReproduciblePaths, indent, delSet, forceScalarRewrite, nodeRewriteTargets, normalizationRewriteTargets, mappingReinsertions, rootMappingEmpty); ok {
+	if patched, ok := structuralRewrite(original, ordered, origOrdered, liveRootSnapshot, boundsIdx, unsafePaths, opaquePaths, indent, delSet, forceScalarRewrite, nodeRewriteTargets, mappingReinsertions, rootMappingEmpty); ok {
 		return validateEditedOutputWithNodeIntents(patched, nodeRewriteTargets, semanticExpected)
 	}
 	if surgicalValidationErr != nil {
@@ -418,7 +413,7 @@ func standardEncode(doc *yaml.Node, indent int) ([]byte, error) {
 }
 
 // structuralRewrite surgically re-encodes individual key regions using boundsIdx.
-func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, liveRoot *yaml.Node, boundsIdx map[string][]kvBounds, unsafePaths, opaquePaths, nonReproduciblePaths map[string]struct{}, baseIndent int, delSet, forceScalarRewrite map[string]struct{}, nodeRewriteTargets map[string]yamlNodeSignature, normalizationRewriteTargets map[string]struct{}, mappingReinsertions []string, rootMappingEmpty bool) ([]byte, bool) {
+func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, liveRoot *yaml.Node, boundsIdx map[string][]kvBounds, unsafePaths, opaquePaths map[string]struct{}, baseIndent int, delSet, forceScalarRewrite map[string]struct{}, nodeRewriteTargets map[string]yamlNodeSignature, mappingReinsertions []string, rootMappingEmpty bool) ([]byte, bool) {
 	if rootMappingEmpty && len(ordered) == 0 && len(origOrdered) > 0 {
 		for pk := range unsafePaths {
 			if parts, ok := splitJoinedPath(pk); ok && len(parts) == 1 {
@@ -484,22 +479,10 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		if !ok {
 			return nil, false
 		}
-		// Automatic parse normalization must not promote through source syntax
-		// that yaml.v3 cannot reproduce. Intentional public replacements and
-		// ordinary live-AST rewrites retain the existing opaque-path behavior.
-		_, automaticNormalization := normalizationRewriteTargets[encoded]
 		for depth := len(segments); depth >= 1; depth-- {
 			ancestor := joinPath(segments[:depth])
 			if len(boundsIdx[ancestor]) == 0 {
 				continue
-			}
-			// A bare non-specific `!` is resolved but not retained as an emitter
-			// token. Exact-path replacements remain intentional; automatic ancestor
-			// promotion must fail closed instead of rewriting that untouched syntax.
-			if automaticNormalization && depth < len(segments) {
-				if _, nonReproducible := nonReproduciblePaths[ancestor]; nonReproducible {
-					return nil, false
-				}
 			}
 			if depth == len(segments) {
 				if _, unsafe := unsafePaths[ancestor]; !unsafe {
@@ -1446,7 +1429,7 @@ func collectChangedKeysDeep(orig interface{}, cur interface{}, path []string) []
 
 			// Recurse into nested mappings.
 			if subCur, ok := cv.(gyaml.MapSlice); ok {
-				// Preserve the old behavior for map shape transitions.
+				// Record the parent path when a mapping changes shape.
 				if !okOrig || !logicalEqual(toPlain(ov), toPlain(cv)) {
 					if ovMs, okMs := ov.(gyaml.MapSlice); !okMs || len(subCur) == 0 || len(ovMs) == 0 {
 						out = append(out, makePathKey(path, k))

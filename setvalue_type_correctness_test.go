@@ -9,6 +9,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type unsupportedSetValue struct {
+	text string
+}
+
 func TestSetValueUsesTheSameScalarTypeAtEveryDepth(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -67,6 +71,37 @@ func TestSetValueUsesTheSameScalarTypeAtEveryDepth(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSetValueMarksUnsupportedTypesAtEveryDepth(t *testing.T) {
+	doc, err := Parse([]byte("{}\n"))
+	require.NoError(t, err)
+	root := doc.Content[0]
+	unsupported := unsupportedSetValue{text: "must not be stringified"}
+
+	SetValue(root, "direct", unsupported, SetValueOptions{})
+	SetValue(root, "nested", map[string]any{"value": unsupported}, SetValueOptions{})
+	SetValue(root, "sequence", []any{unsupported}, SetValueOptions{})
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	var round yaml.Node
+	require.NoError(t, yaml.Unmarshal(out, &round), "output:\n%s", out)
+	parsedRoot := round.Content[0]
+
+	direct := mappingValueForStringKey(t, parsedRoot, "direct")
+	require.Equal(t, "!!str", direct.Tag)
+	require.Equal(t, setValueTypeMarker, direct.Value)
+
+	nested := mappingValueForStringKey(t, parsedRoot, "nested")
+	nestedValue := mappingValueForStringKey(t, nested, "value")
+	require.Equal(t, "!!str", nestedValue.Tag)
+	require.Equal(t, setValueTypeMarker, nestedValue.Value)
+
+	sequence := mappingValueForStringKey(t, parsedRoot, "sequence")
+	require.Len(t, sequence.Content, 1)
+	require.Equal(t, "!!str", sequence.Content[0].Tag)
+	require.Equal(t, setValueTypeMarker, sequence.Content[0].Value)
 }
 
 func TestSetValueWritesEmptyCollectionsAndReplacesMappings(t *testing.T) {

@@ -1526,7 +1526,7 @@ func TestPlainStringsWithSpacesStayUnquotedOnUnrelatedChange(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	// Ensure the previously bare strings remain unquoted.
+	// Ensure the source's bare strings remain unquoted.
 	if got := getLineContaining(string(out), "SERVICE_URI_LIST:"); got != "    SERVICE_URI_LIST: http://node-1.example.net:8081,http://node-2.example.net:8081,http://node-3.example.net:8081" {
 		t.Fatalf("SERVICE_URI_LIST line changed:\n%s", out)
 	}
@@ -3624,7 +3624,7 @@ func TestEmptyEnvMapRoundTripDoesNotBecomeNull(t *testing.T) {
 	}
 }
 
-func TestEmptyEnvMapDoesNotSerializeAsNull(t *testing.T) {
+func TestImplicitNullDoesNotMaterializeAsEmptyMap(t *testing.T) {
 	input := `app-chart:
   envs:
 `
@@ -3633,14 +3633,14 @@ func TestEmptyEnvMapDoesNotSerializeAsNull(t *testing.T) {
 
 	out, err := Marshal(doc)
 	require.NoError(t, err)
-	s := string(out)
+	require.Equal(t, input, string(out))
 
-	if strings.Contains(s, "envs:null") || strings.Contains(s, "envs: null") {
-		t.Fatalf("empty env map serialized as null (envs:null):\n%s", s)
-	}
-	if !strings.Contains(s, "envs: {}") {
-		t.Fatalf("expected empty env map to render as envs: {}, got:\n%s", s)
-	}
+	var parsed map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &parsed))
+	appChart, ok := parsed["app-chart"].(map[string]any)
+	require.True(t, ok)
+	require.Contains(t, appChart, "envs")
+	require.Nil(t, appChart["envs"])
 }
 
 func TestCommentBetweenKeysDiscardedWhenAllChildrenDeleted(t *testing.T) {

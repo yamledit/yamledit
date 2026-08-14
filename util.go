@@ -672,61 +672,6 @@ func scalarHasExplicitTag(b []byte, lineOffsets []int, node *yaml.Node) bool {
 	return hasTag
 }
 
-// nodeHasNonSpecificTag reports a bare `!` node property. yaml.v3 resolves that
-// property into the node's ordinary tag but does not retain enough AST state
-// for its encoder to emit the `!` again, so automatic ancestor rewrites must
-// treat it as source-only presentation metadata.
-func nodeHasNonSpecificTag(b []byte, lineOffsets []int, node *yaml.Node) bool {
-	if node == nil {
-		return false
-	}
-	pos := offsetFor(b, lineOffsets, node.Line, node.Column)
-	if pos < 0 || pos >= len(b) {
-		return false
-	}
-	isPropertyEnd := func(c byte) bool {
-		switch c {
-		case ' ', '\t', '\r', '\n', '#', '[', ']', '{', '}', ',':
-			return true
-		default:
-			return false
-		}
-	}
-	for {
-		for pos < len(b) && (b[pos] == ' ' || b[pos] == '\t') {
-			pos++
-		}
-		if pos >= len(b) || b[pos] == '\r' || b[pos] == '\n' || b[pos] == '#' {
-			return false
-		}
-		switch b[pos] {
-		case '&':
-			pos++
-			for pos < len(b) && !isPropertyEnd(b[pos]) {
-				pos++
-			}
-		case '!':
-			if pos+1 >= len(b) || isPropertyEnd(b[pos+1]) {
-				return true
-			}
-			if b[pos+1] == '<' {
-				end := bytes.IndexByte(b[pos+2:], '>')
-				if end < 0 {
-					return false
-				}
-				pos += end + 3
-				continue
-			}
-			pos++
-			for pos < len(b) && !isPropertyEnd(b[pos]) {
-				pos++
-			}
-		default:
-			return false
-		}
-	}
-}
-
 func scalarValueProperties(b []byte, lineOffsets []int, node *yaml.Node) (int, bool) {
 	pos := offsetFor(b, lineOffsets, node.Line, node.Column)
 	if pos < 0 || pos >= len(b) || node.Kind != yaml.ScalarNode {
@@ -909,6 +854,43 @@ func findScalarEndOnLine(b []byte, pos int) int {
 		k--
 	}
 	return k
+}
+
+// findFlowScalarEnd returns the exclusive end of a scalar token inside a flow
+// collection. Unlike a block-style plain scalar, an unquoted flow scalar ends
+// at the next comma or closing collection delimiter.
+func findFlowScalarEnd(b []byte, pos int) int {
+	if pos < 0 || pos >= len(b) {
+		return pos
+	}
+	if b[pos] == '\'' || b[pos] == '"' {
+		return findScalarEndOnLine(b, pos)
+	}
+	lineEnd := findLineEnd(b, pos)
+	limit := lineEnd
+	if lineEnd >= 0 && lineEnd < len(b) && b[lineEnd] != '\n' {
+		limit = lineEnd + 1
+	}
+	end := pos
+	for end < limit {
+		switch b[end] {
+		case ',', ']', '}':
+			limit = end
+			end = limit
+			continue
+		case '#':
+			if end == pos || b[end-1] == ' ' || b[end-1] == '\t' {
+				limit = end
+				end = limit
+				continue
+			}
+		}
+		end++
+	}
+	for limit > pos && (b[limit-1] == ' ' || b[limit-1] == '\t' || b[limit-1] == '\r') {
+		limit--
+	}
+	return limit
 }
 
 // scalarSpansPhysicalLines reports scalars whose token or plain continuation
@@ -1395,7 +1377,7 @@ func stringReplacementToken(oldTok []byte, newVal string) []byte {
 	if len(oldTok) > 0 && oldTok[0] == '"' {
 		return []byte(`"` + escapeDoubleQuotes(newVal) + `"`)
 	}
-	// Bare previously
+	// Preserve an unquoted source token when the replacement remains safe.
 	if isSafeBareString(newVal) {
 		return []byte(newVal)
 	}

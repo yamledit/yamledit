@@ -80,7 +80,7 @@ func TestWholeSequenceRewriteSkipsStaleDescendantScalarChecks(t *testing.T) {
 	}]`)))
 
 	// Once the block patch has matched and reused the surviving item, descendant
-	// scalar surgery must not compare it to the removed item formerly at index 0.
+	// scalar surgery must not compare it to the removed item from index 0.
 	out, err := Marshal(doc)
 	require.NoError(t, err)
 	require.Equal(t, "items:\n  - name: keep # retain\n    value: text\n", string(out))

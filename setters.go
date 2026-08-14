@@ -20,7 +20,7 @@ type SetValueOptions struct {
 }
 
 // EnsurePath returns a mapping node for the nested keys (creates when missing).
-// It now accepts either a root DocumentNode or a MappingNode as the starting point.
+// It accepts either a root DocumentNode or a MappingNode as the starting point.
 func EnsurePath(node *yaml.Node, first string, rest ...string) *yaml.Node {
 	if node == nil {
 		return nil
@@ -352,8 +352,8 @@ func setScalarValue(
 		return
 	}
 
-	// If this mapping node is already indexed as a mapping (i.e. reachable by keys),
-	// keep existing behavior and update the ordered MapSlice via the mapping path.
+	// If this mapping node is indexed as a mapping (i.e. reachable by keys),
+	// update the ordered MapSlice through that mapping path.
 	mapRef := weak.Make(mapNode)
 	if _, ok := st.subPathByHN[mapRef]; !ok && docHN != nil && len(docHN.Content) > 0 {
 		indexMappingHandles(st, docHN.Content[0], nil)
@@ -398,7 +398,7 @@ func setScalarValue(
 		return
 	}
 
-	// The AST remains updated even when this legacy source-offset lookup cannot
+	// The AST remains updated even when this source-offset fallback cannot
 	// reconcile the ordered shadow. Marshal compares it with the expected live
 	// tree and either finds a safe scoped rewrite or returns an error.
 	recordExpectedASTLocked(st)
@@ -587,8 +587,9 @@ func SetStringMapValues(mapNode *yaml.Node, fields map[string]string, opts SetVa
 }
 
 // SetValue replaces the value under a YAML mapping key with a scalar, mapping,
-// or sequence. A nil value deletes the key. SetMapValues remains the API for
-// merging a set of fields into an existing mapping.
+// or sequence. A nil value deletes the key. SetMapValues is the API for
+// merging a set of fields into an existing mapping. Unsupported value types and
+// unrepresentable collection branches are written as quoted diagnostic strings.
 func SetValue(mapNode *yaml.Node, key string, value any, opts SetValueOptions) {
 	if value == nil {
 		DeleteKey(mapNode, key)
@@ -1120,6 +1121,7 @@ const (
 	setValueCycleMarker = "<yamledit: cyclic value>"
 	setValueDepthMarker = "<yamledit: value nesting limit exceeded>"
 	setValueSizeMarker  = "<yamledit: value size limit exceeded>"
+	setValueTypeMarker  = "<yamledit: unsupported value type>"
 )
 
 type setValueContainerIdentity struct {
@@ -1248,16 +1250,14 @@ func (n *setValueNormalizer) normalize(value any, opts SetValueOptions, depth in
 		return v
 	case json.Number:
 		if !isValidJSONNumber(v) {
-			// SetValue cannot return a validation error. Match its existing fallback
-			// for unsupported scalar types by preserving the caller's text as a YAML
-			// string, never as trusted syntax that could escape its containing value.
+			// SetValue cannot return a validation error, so preserve the caller's
+			// text as a YAML string, never as trusted syntax that could escape its
+			// containing value.
 			return string(v)
 		}
 		return v
 	default:
-		// Preserve SetValue's established best-effort behavior for unsupported
-		// values, but normalize it here so nested and direct values agree.
-		return fmt.Sprintf("%v", v)
+		return setValueTypeMarker
 	}
 }
 

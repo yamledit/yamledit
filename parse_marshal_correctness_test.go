@@ -58,134 +58,78 @@ func TestStructuralRewriteConsumesMultilineDelimitedValue(t *testing.T) {
 	}
 }
 
-func TestImplicitMapNormalizationPreservesCommentAfterPlainQuoteCharacter(t *testing.T) {
-	doc, err := Parse([]byte("0\": #\n"))
-	require.NoError(t, err)
-
-	out, err := Marshal(doc)
-	require.NoError(t, err)
-	require.Equal(t, "0\": {} #\n", string(out))
-}
-
-func TestImplicitMapNormalizationPreservesFlowCollectionLineComment(t *testing.T) {
-	doc, err := Parse([]byte("00A: &base {0000:00,000A: [A,A]}#00000000"))
-	require.NoError(t, err)
-
-	out, err := Marshal(doc)
-	require.NoError(t, err)
-	require.Contains(t, string(out), "#00000000")
-
-	var reparsed yaml.Node
-	require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
-	value := reparsed.Content[0].Content[1]
-	require.Equal(t, yaml.MappingNode, value.Kind)
-	require.Equal(t, "base", value.Anchor)
-	commentCount := 0
-	stack := []*yaml.Node{&reparsed}
-	for len(stack) > 0 {
-		node := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		for _, comment := range []string{node.HeadComment, node.LineComment, node.FootComment} {
-			if comment == "#00000000" {
-				commentCount++
-			}
-		}
-		stack = append(stack, node.Content...)
+func TestParseMarshalPreservesImplicitNullsExactly(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "block", input: "config:\n"},
+		{name: "inline comment", input: "0\": #\n"},
+		{name: "root anchor and comments", input: "&000000000 #000000\n00000000A: #000000"},
+		{name: "flow collection line comment", input: "00A: &base {0000:00,000A: [A,A]}#00000000"},
+		{name: "flow scalar spelling", input: "000A: {1001A: [000,00],00000A: {00000000000A}}#00000000000"},
+		{name: "bare non-specific tag", input: "A:\n  - 0000A: !\n  - {A}"},
+		{name: "custom tag sibling", input: "container: {target: , sibling: !Custom value}\n"},
 	}
-	require.Equal(t, 1, commentCount, "output:\n%s", out)
-	normalized, exists := yamlNodeAtPathSegments(reparsed.Content[0], []string{"00A", "0000:00"})
-	require.True(t, exists, "output:\n%s", out)
-	require.Equal(t, yaml.MappingNode, normalized.Kind)
-	require.Empty(t, normalized.Content)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := Parse([]byte(tt.input))
+			require.NoError(t, err)
+			before := cloneYAMLNodeGraph(doc)
+
+			out, err := Marshal(doc)
+			require.NoError(t, err)
+			require.Equal(t, tt.input, string(out))
+			require.True(t, yamlNodeGraphEqual(doc, before), "no-op Marshal mutated the YAML graph")
+
+			roundTrip, err := Parse(out)
+			require.NoError(t, err)
+			require.True(t, yamlNodeGraphEqual(doc, roundTrip), "exact no-op output changed the YAML graph")
+		})
+	}
 }
 
-func TestFlowImplicitMapNormalizationPreservesSiblingScalarSpelling(t *testing.T) {
-	input := []byte("000A: {1001A: [000,00],00000A: {00000000000A}}#00000000000")
-	doc, err := Parse(input)
+func TestParseKeepsImplicitNullAsNullNode(t *testing.T) {
+	doc, err := Parse([]byte("config:\n"))
 	require.NoError(t, err)
+	require.Len(t, doc.Content[0].Content, 2)
+	value := doc.Content[0].Content[1]
+	require.Equal(t, yaml.ScalarNode, value.Kind)
+	require.Equal(t, "!!null", value.Tag)
+	require.Empty(t, value.Value)
+}
+
+func TestEnsurePathExplicitlyConvertsImplicitNullToMapping(t *testing.T) {
+	doc, err := Parse([]byte("config:\nsibling: keep\n"))
+	require.NoError(t, err)
+
+	config := EnsurePath(doc, "config")
+	require.NotNil(t, config)
+	require.Equal(t, yaml.MappingNode, config.Kind)
+	SetValue(config, "enabled", true, SetValueOptions{})
 
 	out, err := Marshal(doc)
 	require.NoError(t, err)
-	require.Contains(t, string(out), "[000, 00]")
-	require.Contains(t, string(out), "#00000000000")
-
-	var reparsed yaml.Node
-	require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
-	sequence, exists := yamlNodeAtPathSegments(reparsed.Content[0], []string{"000A", "1001A"})
+	roundTrip, err := Parse(out)
+	require.NoError(t, err, "output:\n%s", out)
+	enabled, exists := yamlNodeAtPathSegments(roundTrip.Content[0], []string{"config", "enabled"})
 	require.True(t, exists, "output:\n%s", out)
-	require.Equal(t, yaml.SequenceNode, sequence.Kind)
-	require.Len(t, sequence.Content, 2)
-	require.Equal(t, "000", sequence.Content[0].Value)
-	require.Equal(t, "00", sequence.Content[1].Value)
+	require.Equal(t, yaml.ScalarNode, enabled.Kind)
+	require.Equal(t, "!!bool", enabled.Tag)
+	require.Equal(t, "true", enabled.Value)
+	sibling, exists := yamlNodeAtPathSegments(roundTrip.Content[0], []string{"sibling"})
+	require.True(t, exists, "output:\n%s", out)
+	require.Equal(t, "keep", sibling.Value)
 }
 
-func TestFlowImplicitMapNormalizationFailsClosedAroundExplicitTag(t *testing.T) {
-	input := []byte("A:\n  - 0000A: !\n  - {A}")
-	doc, err := Parse(input)
-	require.NoError(t, err)
-	before := cloneYAMLNodeGraph(doc)
-	st, registered := lookup(doc)
-	require.True(t, registered)
-	st.mu.RLock()
-	_, nonReproducible := st.nonReproduciblePathKeys[joinPath([]string{"A"})]
-	_, opaque := st.opaquePathKeys[joinPath([]string{"A"})]
-	st.mu.RUnlock()
-	require.True(t, nonReproducible)
-	require.False(t, opaque, "bare ! must use the distinct non-reproducible index")
-
-	_, err = Marshal(doc)
-	require.Error(t, err)
-	require.True(t, yamlNodeGraphEqual(doc, before), "failed Marshal mutated the YAML graph")
-}
-
-func TestFlowImplicitNormalizationPreservesReproducibleCustomTag(t *testing.T) {
-	input := []byte("container: {target: , sibling: !Custom value}\n")
-	doc, err := Parse(input)
-	require.NoError(t, err)
-	st, registered := lookup(doc)
-	require.True(t, registered)
-	containerPath := joinPath([]string{"container"})
-	targetPath := joinPath([]string{"container", "target"})
-	st.mu.RLock()
-	intent := st.nodeRewriteIntents[targetPath]
-	_, opaque := st.opaquePathKeys[containerPath]
-	_, nonReproducible := st.nonReproduciblePathKeys[containerPath]
-	st.mu.RUnlock()
-	require.True(t, intent.automaticNormalization)
-	require.True(t, opaque, "custom tag should remain opaque to ordered-shadow rewrites")
-	require.False(t, nonReproducible, "yaml.v3 can reproduce a named custom tag")
-
-	out, err := Marshal(doc)
-	require.NoError(t, err)
-	var reparsed yaml.Node
-	require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
-	target, exists := yamlNodeAtPathSegments(reparsed.Content[0], []string{"container", "target"})
-	require.True(t, exists, "output:\n%s", out)
-	require.Equal(t, yaml.MappingNode, target.Kind)
-	sibling, exists := yamlNodeAtPathSegments(reparsed.Content[0], []string{"container", "sibling"})
-	require.True(t, exists, "output:\n%s", out)
-	require.Equal(t, "!Custom", sibling.Tag)
-	require.Equal(t, "value", sibling.Value)
-}
-
-func TestSetValueClearsAutomaticNormalizationProvenance(t *testing.T) {
+func TestSetValueReplacesImplicitNullInFlowCollection(t *testing.T) {
 	input := []byte("container: {target: , sibling: !Custom value}\n")
 	doc, err := Parse(input)
 	require.NoError(t, err)
 	container := doc.Content[0].Content[1]
-	st, registered := lookup(doc)
-	require.True(t, registered)
-	targetPath := joinPath([]string{"container", "target"})
-	st.mu.RLock()
-	require.True(t, st.nodeRewriteIntents[targetPath].automaticNormalization)
-	st.mu.RUnlock()
 
 	SetValue(container, "target", map[string]any{"nested": true}, SetValueOptions{})
-	st.mu.RLock()
-	intent := st.nodeRewriteIntents[targetPath]
-	st.mu.RUnlock()
-	require.False(t, intent.automaticNormalization)
-	require.True(t, intent.wholeCollectionReplacement)
 
 	out, err := Marshal(doc)
 	require.NoError(t, err)
@@ -199,30 +143,23 @@ func TestSetValueClearsAutomaticNormalizationProvenance(t *testing.T) {
 	require.Equal(t, "!Custom", sibling.Tag)
 }
 
-func TestAutomaticNormalizationProvenanceRebasesWithSequenceItem(t *testing.T) {
-	doc, err := Parse([]byte("items:\n  - {target: }\n  - keep\n"))
+func TestFlowScalarPatchPreservesImplicitNullSibling(t *testing.T) {
+	input := []byte("base: {x: 0,A}")
+	doc, err := Parse(input)
 	require.NoError(t, err)
-	st, registered := lookup(doc)
-	require.True(t, registered)
-	originalPath := joinPath([]string{"items", "[0]", "target"})
-	shiftedPath := joinPath([]string{"items", "[1]", "target"})
-	st.mu.RLock()
-	require.True(t, st.nodeRewriteIntents[originalPath].automaticNormalization)
-	st.mu.RUnlock()
+	require.NoError(t, ApplyJSONPatchBytes(doc, []byte(`[{"op":"replace","path":"/base/x","value":1}]`)))
 
-	require.NoError(t, ApplyJSONPatchBytes(doc, []byte(`[{
-		"op":"add","path":"/items/0","value":{"inserted":true}
-	}]`)))
-	st.mu.RLock()
-	require.True(t, st.nodeRewriteIntents[shiftedPath].automaticNormalization)
-	st.mu.RUnlock()
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.Equal(t, "base: {x: 1,A}", string(out))
 
-	require.NoError(t, ApplyJSONPatchBytes(doc, []byte(`[{
-		"op":"remove","path":"/items/0"
-	}]`)))
-	st.mu.RLock()
-	require.True(t, st.nodeRewriteIntents[originalPath].automaticNormalization)
-	st.mu.RUnlock()
+	roundTrip, err := Parse(out)
+	require.NoError(t, err)
+	nullValue, exists := yamlNodeAtPathSegments(roundTrip.Content[0], []string{"base", "A"})
+	require.True(t, exists)
+	require.Equal(t, yaml.ScalarNode, nullValue.Kind)
+	require.Equal(t, "!!null", nullValue.Tag)
+	require.Empty(t, nullValue.Value)
 }
 
 func TestFlowExplicitNullReplacementCanRewriteOpaqueSibling(t *testing.T) {
@@ -298,14 +235,16 @@ func TestParseRejectsComplexMappingKeys(t *testing.T) {
 	require.Equal(t, "1: integer\n", string(out))
 }
 
-func TestImplicitMapNormalizationDoesNotDropMappingKeyAnchor(t *testing.T) {
-	doc, err := Parse([]byte("&0::"))
+func TestImplicitNullNoopPreservesMappingKeyAnchor(t *testing.T) {
+	input := []byte("&0::")
+	doc, err := Parse(input)
 	require.NoError(t, err)
 	before := cloneYAMLNodeGraph(doc)
 
-	_, err = Marshal(doc)
-	require.Error(t, err)
-	require.True(t, yamlNodeGraphEqual(doc, before), "failed Marshal mutated the YAML graph")
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.Equal(t, input, out)
+	require.True(t, yamlNodeGraphEqual(doc, before), "no-op Marshal mutated the YAML graph")
 }
 
 func TestAnchoredCollectionEditKeepsAliasSyntax(t *testing.T) {
@@ -480,22 +419,22 @@ func TestMarshalRejectsMalformedLiveMappingWithoutPanic(t *testing.T) {
 	require.ErrorContains(t, err, "malformed YAML mapping node")
 }
 
-func TestImplicitEmptyMapNormalizationPreservesIndentedComment(t *testing.T) {
+func TestImplicitNullNoopPreservesIndentedComment(t *testing.T) {
 	input := []byte("a:\n  # important\nkeep: yes\n")
 	doc, err := Parse(input)
 	require.NoError(t, err)
 
 	out, err := Marshal(doc)
 	require.NoError(t, err)
-	require.Equal(t, "a: {}\n  # important\nkeep: yes\n", string(out))
+	require.Equal(t, input, out)
 
 	var got map[string]any
 	require.NoError(t, yaml.Unmarshal(out, &got))
-	require.Equal(t, map[string]any{}, got["a"])
+	require.Nil(t, got["a"])
 	require.Equal(t, "yes", got["keep"])
 }
 
-func TestImplicitMapNormalizationDoesNotOverwriteWinningDuplicate(t *testing.T) {
+func TestDuplicateCleanupDoesNotOverwriteWinningValue(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
@@ -540,18 +479,21 @@ func TestParseUsesLiveASTWhenYAMLParsersDisagree(t *testing.T) {
 	// while yaml.v3 (whose public AST Parse returns) reads key "0:". The shadow
 	// must follow that live AST or even a no-op Marshal validates against the
 	// wrong logical path.
-	doc, err := Parse([]byte("A: {0:}"))
+	input := []byte("A: {0:}")
+	doc, err := Parse(input)
 	require.NoError(t, err)
 
 	out, err := Marshal(doc)
 	require.NoError(t, err)
+	require.Equal(t, input, out)
 
 	var reparsed yaml.Node
 	require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
 	value, exists := yamlNodeAtPathSegments(reparsed.Content[0], []string{"A", "0:"})
 	require.True(t, exists, "output:\n%s", out)
-	require.Equal(t, yaml.MappingNode, value.Kind)
-	require.Empty(t, value.Content)
+	require.Equal(t, yaml.ScalarNode, value.Kind)
+	require.Equal(t, "!!null", value.Tag)
+	require.Empty(t, value.Value)
 }
 
 func TestMarshalHonorsDirectAliasInsertionIntoEmptySource(t *testing.T) {

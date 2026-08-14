@@ -464,8 +464,8 @@ func cloneYAMLNodeGraphWithMap(root *yaml.Node) (*yaml.Node, map[*yaml.Node]*yam
 	return clone(root), seen
 }
 
-// resolveUnregisteredStart preserves JSON Patch support for standalone yaml.Node
-// values. Registered nodes must instead be classified by
+// resolveUnregisteredStart validates standalone yaml.Node values. Registered
+// nodes must instead be classified by
 // resolveRegisteredStartLocked so their fields are never read outside st.mu.
 func resolveUnregisteredStart(node *yaml.Node) (*yaml.Node, error) {
 	switch node.Kind {
@@ -1222,8 +1222,7 @@ func rebaseNodeRewriteIntentsForSequence(st *docState, sequencePath []string, in
 				continue
 			}
 			intent.target = yamlNodeSignature{}
-			intent.automaticNormalization = false
-			// Preserve an explicit tombstone even when this path was previously
+			// Preserve an explicit tombstone even when this path was already
 			// created during the same edit history. A subsequent add at the same
 			// index is a replacement of the original source occupant for output
 			// purposes, not a fresh insertion that may reuse its custom tag.
@@ -2517,12 +2516,4 @@ func orderedUpsertAtPathTokens(ms gyaml.MapSlice, path []ptrToken, val interface
 		return ms, fmt.Errorf("orderedUpsertAtPath: root type changed (%T)", out)
 	}
 	return res, nil
-}
-
-// setOrderedAtPath updates an ordered MapSlice using a ptrToken path
-// (keys + indices). It’s a thin wrapper around orderedSetAtPathTokens so
-// callers that already operate on ptrToken paths (like normalizeImplicitMaps)
-// can reuse the same machinery.
-func setOrderedAtPath(ms gyaml.MapSlice, path []ptrToken, val interface{}) (gyaml.MapSlice, error) {
-	return orderedSetAtPathTokens(ms, path, val)
 }

@@ -19,7 +19,7 @@ type docState struct {
 	// tree to detect direct caller edits, including presentation-only changes that
 	// cannot be represented in the ordered logical shadow.
 	expectedAST *yaml.Node
-	// originalAST is an immutable graph snapshot of the normalized source tree.
+	// originalAST is an immutable graph snapshot of the parsed source tree.
 	// Node-rewrite intents are compared with the node originally occupying their
 	// final path, which remains correct when sequence insertions rebase an edit.
 	originalAST *yaml.Node
@@ -56,11 +56,6 @@ type docState struct {
 	boundsByPathKey map[string][]kvBounds
 	unsafePathKeys  map[string]struct{}
 	opaquePathKeys  map[string]struct{} // container rewrites would lose source-only metadata
-	// nonReproduciblePathKeys marks source regions containing syntax that yaml.v3
-	// resolves but cannot faithfully emit again (currently the bare non-specific
-	// `!` property). Automatic parse normalization must not promote a rewrite
-	// through one of these regions.
-	nonReproduciblePathKeys map[string]struct{}
 
 	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
 	// forceScalarRewrite records scalar paths whose requested YAML tag changed
@@ -94,7 +89,6 @@ type nodeRewriteIntent struct {
 	target                     yamlNodeSignature
 	removedDuringEdits         bool
 	wholeCollectionReplacement bool
-	automaticNormalization     bool
 }
 
 func signatureOfYAMLNode(node *yaml.Node) yamlNodeSignature {
@@ -127,10 +121,9 @@ func recordNodeReplacementIntentLocked(st *docState, path []string, old *yaml.No
 	}
 	intent.target = target
 	// Ordinary replacements preserve any source presentation that remains
-	// compatible with the requested kind/tag. Whole collection replacement and
-	// parse-time flow normalization opt into a whole-value rewrite separately.
+	// compatible with the requested kind/tag. Whole collection replacement opts
+	// into a whole-value rewrite separately.
 	intent.wholeCollectionReplacement = false
-	intent.automaticNormalization = false
 	st.nodeRewriteIntents[encoded] = intent
 
 	// Replacing a container also replaces every descendant. Preserve each
@@ -143,7 +136,6 @@ func recordNodeReplacementIntentLocked(st *docState, path []string, old *yaml.No
 		segments, ok := splitJoinedPath(descendant)
 		if ok && len(segments) > len(path) && pathSegmentsEqual(segments[:len(path)], path) {
 			childIntent.target = yamlNodeSignature{}
-			childIntent.automaticNormalization = false
 			st.nodeRewriteIntents[descendant] = childIntent
 		}
 	}
@@ -167,23 +159,6 @@ func markWholeCollectionReplacementIntentLocked(st *docState, path []string) {
 	st.nodeRewriteIntents[encoded] = intent
 }
 
-// markAutomaticNormalizationIntentLocked marks the whole-node replacement
-// created only by Parse when it materializes an implicit null inside a flow
-// collection. Later public replacement/removal recorders clear this provenance.
-func markAutomaticNormalizationIntentLocked(st *docState, path []string) {
-	if st == nil || len(path) == 0 {
-		return
-	}
-	encoded := joinPath(path)
-	intent, ok := st.nodeRewriteIntents[encoded]
-	if !ok || !intent.target.exists || intent.target.kind != yaml.MappingNode || intent.target.tag != "!!map" {
-		return
-	}
-	intent.wholeCollectionReplacement = true
-	intent.automaticNormalization = true
-	st.nodeRewriteIntents[encoded] = intent
-}
-
 func recordNodeRemovalIntentLocked(st *docState, path []string, old *yaml.Node) {
 	if st == nil || len(path) == 0 {
 		return
@@ -199,13 +174,11 @@ func recordNodeRemovalIntentLocked(st *docState, path []string, old *yaml.Node) 
 	intent.target = yamlNodeSignature{}
 	intent.removedDuringEdits = true
 	intent.wholeCollectionReplacement = false
-	intent.automaticNormalization = false
 	st.nodeRewriteIntents[encoded] = intent
 	for descendant, childIntent := range st.nodeRewriteIntents {
 		segments, ok := splitJoinedPath(descendant)
 		if ok && len(segments) > len(path) && pathSegmentsEqual(segments[:len(path)], path) {
 			childIntent.target = yamlNodeSignature{}
-			childIntent.automaticNormalization = false
 			st.nodeRewriteIntents[descendant] = childIntent
 		}
 	}
@@ -244,7 +217,6 @@ func recordShiftedSubtreeIntentsLocked(st *docState, path []string, shifted *yam
 			if previous, ok := st.nodeRewriteIntents[encoded]; ok {
 				intent.removedDuringEdits = previous.removedDuringEdits
 				intent.wholeCollectionReplacement = previous.wholeCollectionReplacement
-				intent.automaticNormalization = previous.automaticNormalization
 			}
 			st.nodeRewriteIntents[encoded] = intent
 		} else {
@@ -255,8 +227,7 @@ func recordShiftedSubtreeIntentsLocked(st *docState, path []string, shifted *yam
 			// move back onto an original index after a transient insertion is removed.
 			// Retain lifecycle/provenance that follows the same logical item and
 			// refresh its live target while it is parked beyond the source sequence.
-			if previous, ok := st.nodeRewriteIntents[encoded]; ok &&
-				(previous.removedDuringEdits || previous.automaticNormalization) {
+			if previous, ok := st.nodeRewriteIntents[encoded]; ok && previous.removedDuringEdits {
 				previous.target = signatureOfYAMLNode(current)
 				st.nodeRewriteIntents[encoded] = previous
 			} else {
@@ -362,22 +333,6 @@ func activeNodeRewriteIntentsLocked(st *docState, root *yaml.Node) map[string]ya
 		active[encoded] = intent.target
 	}
 	return active
-}
-
-// activeAutomaticNormalizationIntentsLocked filters the already-validated live
-// rewrite targets down to replacements created automatically by Parse.
-// The caller must hold st.mu.
-func activeAutomaticNormalizationIntentsLocked(st *docState, active map[string]yamlNodeSignature) map[string]struct{} {
-	normalized := make(map[string]struct{})
-	if st == nil {
-		return normalized
-	}
-	for encoded := range active {
-		if intent, ok := st.nodeRewriteIntents[encoded]; ok && intent.automaticNormalization {
-			normalized[encoded] = struct{}{}
-		}
-	}
-	return normalized
 }
 
 // activeMappingReinsertionsLocked returns original mapping entries that were

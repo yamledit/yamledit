@@ -70,9 +70,7 @@ func marshalBySurgery(
 	}
 	for _, pk := range collectChangedKeysDeep(originalOrdered, current, nil) {
 		if _, unsafe := unsafePaths[pk]; unsafe {
-			segments, pathOK := splitJoinedPath(pk)
-			indexedScalar := pathOK && len(segments) >= 2 && isIndexPathSegment(segments[len(segments)-2]) && len(valIdx[pk]) > 0
-			if !indexedScalar {
+			if len(valIdx[pk]) == 0 {
 				return nil, false
 			}
 		}
@@ -102,7 +100,7 @@ func marshalBySurgery(
 		}
 
 		// 1) Replace ints/strings/bools/floats/null that changed (and existed originally),
-		//    including inside arrays of mappings. (Scalar arrays handled above now).
+		//    including inside arrays of mappings. Scalar arrays are handled above.
 		replaceOK, replPatches := buildReplacementPatches(original, current, originalOrdered, valIdx, seqIdx, boundsIdx, replacedSeqs, unsafePaths, baseIndent, forceScalarRewrite)
 		if !replaceOK {
 			return nil, false
@@ -113,8 +111,7 @@ func marshalBySurgery(
 			patches = append(patches, p)
 		}
 
-		// 2) Remove duplicates in original (keep LAST occurrence), but ignore keys marked for deletion
-		// MODIFIED: Use boundsIdx instead of valIdx
+		// 2) Remove duplicates in original (keep LAST occurrence), but ignore keys marked for deletion.
 		dupPatchesOK, dupPatches := buildDuplicateRemovalPatches(original, boundsIdx, unsafePaths, deletions, replacedSeqs)
 		if !dupPatchesOK {
 			return nil, false
@@ -137,7 +134,7 @@ func marshalBySurgery(
 		}
 
 		// 3b) Append NEW items to sequences (arrays) at the end (safe styles only).
-		//     Skip sequences we fully replaced above. (This is now redundant if buildSeqReplaceBlockPatches handles appends).
+		//     replacedSeqs prevents a second patch for sequences rewritten above.
 		seqOK, seqPatches := buildSeqAppendPatches(original, current, originalOrdered, seqIdx, baseIndent, replacedSeqs)
 		if !seqOK {
 			return nil, false
@@ -148,8 +145,7 @@ func marshalBySurgery(
 			patches = append(patches, p)
 		}
 
-		// 4) Explicit deletions (remove all occurrences)
-		// MODIFIED: Use boundsIdx instead of valIdx
+		// 4) Explicit deletions (remove all occurrences).
 		delOK, delPatches := buildDeletionPatches(original, deletions, boundsIdx, unsafePaths)
 		if !delOK {
 			return nil, false
@@ -887,11 +883,11 @@ func buildReplacementPatches(
 
 	emit := func(p patch, path []string, key string) bool {
 		if _, unsafe := unsafePaths[makePathKey(path, key)]; unsafe {
-			// A compact mapping key (`- key: value`) owns the sequence dash, so its
-			// whole entry bound is unsafe for deletion/structural promotion. Replacing
-			// only the indexed scalar token remains safe and preserves the dash,
-			// comments, and every sibling. Other unsafe paths still fail closed.
-			if len(path) == 0 || !isIndexSeg(path[len(path)-1]) || p.start == p.end {
+			// Whole-entry bounds can be unsafe in flow collections, compact sequence
+			// mappings, explicit-key layouts, and duplicate subtrees. Replacing only
+			// the exact indexed scalar token remains safe and preserves all surrounding
+			// syntax; candidate validation still verifies the final semantics.
+			if p.start == p.end {
 				return false
 			}
 			occs := valIdx[makePathKey(path, key)]
@@ -1444,23 +1440,9 @@ func buildSeqReplaceBlockPatches(
 	//   • identity / order change when we can derive stable identities
 	//   • deep value change as a final fallback.
 	//
-	// Previously, when namesOf() couldn't derive stable identities
-	// (e.g. sequences of mappings without a "name" field like:
-	//
-	//   routes:
-	//     - host: app.example.com
-	//       paths:
-	//         - /
-	//
-	// ), we conservatively returned true and rewrote the entire block.
-	// The re-rendering path only understood scalar values, so nested
-	// lists like "paths" were flattened into flow-style strings:
-	//   paths: '[/]'
-	//
-	// By falling back to a deep logical comparison when we *don't*
-	// have identities, we avoid touching sequences whose contents
-	// haven't actually changed, so their original YAML (including
-	// nested lists) is preserved byte-for-byte.
+	// When stable identities are unavailable, compare the complete logical
+	// values. This keeps unchanged nested collections byte-stable and limits a
+	// structural rewrite to an actual sequence change.
 	shapeChanged := func(oldArr, newArr []interface{}) bool {
 		if len(oldArr) != len(newArr) {
 			return true

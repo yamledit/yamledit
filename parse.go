@@ -72,83 +72,6 @@ func validateParsedMappingKeys(root *yaml.Node) error {
 	return nil
 }
 
-// normalizeImplicitMaps preserves the package's established convenience that
-// a bare mapping value (`key:`) behaves as an empty mapping. Restrict the
-// coercion to implicit nulls inside ordinary maps: explicit !!null values and
-// null-shaped entries used by semantic mapping types such as !!set must retain
-// their YAML meaning.
-func normalizeImplicitMaps(doc *yaml.Node, st *docState) {
-	if doc == nil || st == nil || doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
-		return
-	}
-	var walk func(*yaml.Node, []ptrToken, bool)
-	walk = func(node *yaml.Node, path []ptrToken, logicalPathActive bool) {
-		if node == nil {
-			return
-		}
-		switch node.Kind {
-		case yaml.MappingNode:
-			if node.Tag != "" && node.Tag != "!!map" {
-				return
-			}
-			for i := 0; i+1 < len(node.Content); i += 2 {
-				key, value := node.Content[i], node.Content[i+1]
-				if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
-					continue
-				}
-				// The ordered shadow uses last-key-wins lookup. Once traversal enters
-				// an earlier duplicate, no descendant path can identify that shadowed
-				// subtree: updating it would instead mutate the corresponding path in
-				// the retained later duplicate.
-				winningOccurrence := true
-				for later := i + 2; later+1 < len(node.Content); later += 2 {
-					if isStringMappingKey(node.Content[later], key.Value) {
-						winningOccurrence = false
-						break
-					}
-				}
-				childPathActive := logicalPathActive && winningOccurrence
-				fullPath := append(append([]ptrToken(nil), path...), ptrToken{key: key.Value})
-				if value.Kind == yaml.ScalarNode && value.Tag == "!!null" && value.Value == "" &&
-					value.Anchor == "" && !scalarHasExplicitTag(st.original, st.lineOffsets, value) {
-					if childPathActive && node.Style&yaml.FlowStyle != 0 {
-						// A flow child has no independent block-style source bound. Mark the
-						// normalization as a whole-node replacement so Marshal can promote
-						// it to a safe live-AST ancestor, retaining source-only scalar
-						// spellings and collection presentation along the way.
-						segments := tokenPathSegments(fullPath)
-						recordNodeReplacementIntentLocked(st, segments, value, yamlNodeSignature{kind: yaml.MappingNode, tag: "!!map", exists: true})
-						markAutomaticNormalizationIntentLocked(st, segments)
-					}
-					replacement := &yaml.Node{
-						Kind:        yaml.MappingNode,
-						Tag:         "!!map",
-						HeadComment: value.HeadComment,
-						LineComment: value.LineComment,
-						FootComment: value.FootComment,
-						Line:        value.Line,
-						Column:      value.Column,
-					}
-					node.Content[i+1] = replacement
-					if childPathActive {
-						if updated, err := setOrderedAtPath(st.ordered, fullPath, gyaml.MapSlice{}); err == nil {
-							st.ordered = updated
-						}
-					}
-					continue
-				}
-				walk(value, fullPath, childPathActive)
-			}
-		case yaml.SequenceNode:
-			for index, child := range node.Content {
-				childPath := append(append([]ptrToken(nil), path...), ptrToken{isIdx: true, index: index})
-				walk(child, childPath, logicalPathActive)
-			}
-		}
-	}
-	walk(doc.Content[0], nil, true)
-}
-
 // Parse reads YAML data and returns a yaml.Node, creating a minimal mapping document if empty.
 func Parse(data []byte) (*yaml.Node, error) {
 	for i, b := range data {
@@ -180,27 +103,26 @@ func Parse(data []byte) (*yaml.Node, error) {
 
 	// Build shadow state using goccy/go-yaml (to preserve comments and ordered map for fallback)
 	st := &docState{
-		doc:                     weak.Make(doc),
-		comments:                gyaml.CommentMap{},
-		ordered:                 gyaml.MapSlice{},
-		subPathByHN:             map[weak.Pointer[yaml.Node]][]string{},
-		indent:                  2,
-		indentSeq:               true,
-		original:                append([]byte(nil), data...),
-		originalRootEmpty:       len(data) > 0 && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0,
-		originalTriviaOnly:      len(data) > 0 && isYAMLTriviaOnly(data),
-		lineOffsets:             buildLineOffsets(data),
-		mapIndex:                map[string]*mapInfo{},
-		valueOccByPathKey:       map[string][]valueOcc{},
-		boundsByPathKey:         map[string][]kvBounds{}, // Initialize new map
-		unsafePathKeys:          map[string]struct{}{},
-		opaquePathKeys:          map[string]struct{}{},
-		nonReproduciblePathKeys: map[string]struct{}{},
-		seqIndex:                map[string]*seqInfo{},
-		forceScalarRewrite:      map[string]struct{}{},
-		forceScalarTags:         map[string]string{},
-		nodeRewriteIntents:      map[string]nodeRewriteIntent{},
-		toDelete:                map[string]struct{}{},
+		doc:                weak.Make(doc),
+		comments:           gyaml.CommentMap{},
+		ordered:            gyaml.MapSlice{},
+		subPathByHN:        map[weak.Pointer[yaml.Node]][]string{},
+		indent:             2,
+		indentSeq:          true,
+		original:           append([]byte(nil), data...),
+		originalRootEmpty:  len(data) > 0 && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0,
+		originalTriviaOnly: len(data) > 0 && isYAMLTriviaOnly(data),
+		lineOffsets:        buildLineOffsets(data),
+		mapIndex:           map[string]*mapInfo{},
+		valueOccByPathKey:  map[string][]valueOcc{},
+		boundsByPathKey:    map[string][]kvBounds{}, // Initialize new map
+		unsafePathKeys:     map[string]struct{}{},
+		opaquePathKeys:     map[string]struct{}{},
+		seqIndex:           map[string]*seqInfo{},
+		forceScalarRewrite: map[string]struct{}{},
+		forceScalarTags:    map[string]string{},
+		nodeRewriteIntents: map[string]nodeRewriteIntent{},
+		toDelete:           map[string]struct{}{},
 	}
 	if st.originalRootEmpty {
 		root := doc.Content[0]
@@ -258,7 +180,6 @@ func Parse(data []byte) (*yaml.Node, error) {
 	// Keep a snapshot of the original ordered map for diffing
 	st.origOrdered = cloneMapSlice(st.ordered)
 
-	normalizeImplicitMaps(doc, st)
 	st.originalAST = cloneYAMLNodeGraph(doc)
 	st.expectedAST = cloneYAMLNodeGraph(doc)
 
@@ -278,7 +199,6 @@ func Parse(data []byte) (*yaml.Node, error) {
 	// to patch ONLY the changed key (e.g. groupId) without re-encoding sibling block scalars.
 	if len(data) > 0 {
 		st.boundsByPathKey, st.unsafePathKeys, st.opaquePathKeys = indexBoundsByPathKeyDeep(st.original, doc)
-		st.nonReproduciblePathKeys = indexNonReproduciblePaths(st.original, doc)
 	}
 
 	register(doc, st)
@@ -663,9 +583,67 @@ func indexMappingHandles(st *docState, n *yaml.Node, cur []string) {
 	}
 }
 
+// indexFlowScalarPositions records exact scalar tokens inside flow collections.
+// Whole-entry bounds remain unsafe there, but replacing one indexed scalar token
+// preserves every delimiter and sibling byte and is validated after surgery.
+func indexFlowScalarPositions(st *docState, node *yaml.Node, path []string) {
+	if st == nil || node == nil {
+		return
+	}
+	record := func(scalar *yaml.Node, pathKey string, containerIndent int) {
+		if scalar == nil || scalar.Kind != yaml.ScalarNode {
+			return
+		}
+		start := scalarValueOffset(st.original, st.lineOffsets, scalar)
+		if start < 0 || start >= len(st.original) {
+			return
+		}
+		end := findFlowScalarEnd(st.original, start)
+		if end <= start || end > len(st.original) {
+			return
+		}
+		st.valueOccByPathKey[pathKey] = append(st.valueOccByPathKey[pathKey], valueOcc{
+			keyLineStart: lineStartOffset(st.lineOffsets, scalar.Line),
+			valStart:     start,
+			valEnd:       end,
+			lineEnd:      findLineEnd(st.original, start),
+			tag:          scalar.Tag,
+			explicitTag:  scalarHasExplicitTag(st.original, st.lineOffsets, scalar),
+			blockStyle:   scalar.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0,
+			multiline:    scalarSpansPhysicalLines(st.original, scalar, start, containerIndent),
+		})
+	}
+
+	switch node.Kind {
+	case yaml.MappingNode:
+		for index := 0; index+1 < len(node.Content); index += 2 {
+			key, value := node.Content[index], node.Content[index+1]
+			if key == nil || key.Kind != yaml.ScalarNode || value == nil {
+				continue
+			}
+			childPath := append(append([]string(nil), path...), key.Value)
+			record(value, makePathKey(path, key.Value), key.Column-1)
+			indexFlowScalarPositions(st, value, childPath)
+		}
+	case yaml.SequenceNode:
+		for index, value := range node.Content {
+			if value == nil {
+				continue
+			}
+			childPath := append(append([]string(nil), path...), indexSeg(index))
+			record(value, makeSeqItemPathKey(path, index), node.Column-1)
+			indexFlowScalarPositions(st, value, childPath)
+		}
+	}
+}
+
 // indexPositions populates indices for surgical edits: mapIndex, valueOccByPathKey, seqIndex, and boundsByPathKey.
 func indexPositions(st *docState, n *yaml.Node, cur []string) {
-	if n == nil || n.Kind != yaml.MappingNode || n.Style&yaml.FlowStyle != 0 {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return
+	}
+	if n.Style&yaml.FlowStyle != 0 {
+		indexFlowScalarPositions(st, n, cur)
 		return
 	}
 	mapPath := joinPath(cur)

@@ -549,6 +549,9 @@ func clearDeletionMarkersAtOrBelow(st *docState, path []string) {
 			continue
 		}
 		if pathSegmentsEqual(segments[:len(path)], path) {
+			if len(segments) == len(path) {
+				restoreRecreatedMappingEntryCommentsLocked(st, path)
+			}
 			delete(st.toDelete, encoded)
 		}
 	}
@@ -667,6 +670,61 @@ func scalarValueOffset(b []byte, lineOffsets []int, node *yaml.Node) int {
 func scalarHasExplicitTag(b []byte, lineOffsets []int, node *yaml.Node) bool {
 	_, hasTag := scalarValueProperties(b, lineOffsets, node)
 	return hasTag
+}
+
+// nodeHasNonSpecificTag reports a bare `!` node property. yaml.v3 resolves that
+// property into the node's ordinary tag but does not retain enough AST state
+// for its encoder to emit the `!` again, so automatic ancestor rewrites must
+// treat it as source-only presentation metadata.
+func nodeHasNonSpecificTag(b []byte, lineOffsets []int, node *yaml.Node) bool {
+	if node == nil {
+		return false
+	}
+	pos := offsetFor(b, lineOffsets, node.Line, node.Column)
+	if pos < 0 || pos >= len(b) {
+		return false
+	}
+	isPropertyEnd := func(c byte) bool {
+		switch c {
+		case ' ', '\t', '\r', '\n', '#', '[', ']', '{', '}', ',':
+			return true
+		default:
+			return false
+		}
+	}
+	for {
+		for pos < len(b) && (b[pos] == ' ' || b[pos] == '\t') {
+			pos++
+		}
+		if pos >= len(b) || b[pos] == '\r' || b[pos] == '\n' || b[pos] == '#' {
+			return false
+		}
+		switch b[pos] {
+		case '&':
+			pos++
+			for pos < len(b) && !isPropertyEnd(b[pos]) {
+				pos++
+			}
+		case '!':
+			if pos+1 >= len(b) || isPropertyEnd(b[pos+1]) {
+				return true
+			}
+			if b[pos+1] == '<' {
+				end := bytes.IndexByte(b[pos+2:], '>')
+				if end < 0 {
+					return false
+				}
+				pos += end + 3
+				continue
+			}
+			pos++
+			for pos < len(b) && !isPropertyEnd(b[pos]) {
+				pos++
+			}
+		default:
+			return false
+		}
+	}
 }
 
 func scalarValueProperties(b []byte, lineOffsets []int, node *yaml.Node) (int, bool) {

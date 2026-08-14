@@ -54,6 +54,67 @@ func TestJSONPatchCanReplaceAnchoredNodeWithoutDanglingAlias(t *testing.T) {
 	require.Equal(t, "new", got["ref"])
 }
 
+func TestJSONPatchMovesScalarInlineCommentToReplacementCollectionKey(t *testing.T) {
+	doc, err := Parse([]byte("target: old # keep\ntail: yes\n"))
+	require.NoError(t, err)
+	require.NoError(t, ApplyJSONPatchBytes(doc, []byte(
+		`[{"op":"replace","path":"/target","value":{"nested":[1]}}]`,
+	)))
+
+	root := doc.Content[0]
+	require.Equal(t, "# keep", root.Content[0].LineComment)
+	require.Empty(t, root.Content[1].LineComment)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.Equal(t, "target: # keep\n  nested:\n    - 1\ntail: yes\n", string(out))
+
+	var reparsed yaml.Node
+	require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
+	require.True(t, yamlNodeGraphEqual(doc, &reparsed), "live AST and serialized graph diverged\noutput:\n%s", out)
+}
+
+func TestReconcileReplacementPresentationUsesLastSourceDuplicate(t *testing.T) {
+	oldNode := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Tag:  "!!map",
+		Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "retained", Style: yaml.DoubleQuotedStyle},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "first", LineComment: "# first occurrence"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "between"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "removed"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "retained", Style: yaml.SingleQuotedStyle},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "last", LineComment: "# winning occurrence"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "tail"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "old tail", LineComment: "# tail"},
+		},
+	}
+	newNode := &yaml.Node{
+		Kind: yaml.MappingNode,
+		Tag:  "!!map",
+		Content: []*yaml.Node{
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "tail"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "new tail"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "added"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "new member"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "retained"},
+			{Kind: yaml.ScalarNode, Tag: "!!str", Value: "replacement"},
+		},
+	}
+
+	reconcileReplacementPresentation(oldNode, newNode)
+
+	require.Len(t, newNode.Content, 6)
+	require.Equal(t, []string{"retained", "tail", "added"}, []string{
+		newNode.Content[0].Value,
+		newNode.Content[2].Value,
+		newNode.Content[4].Value,
+	})
+	require.Equal(t, yaml.SingleQuotedStyle, newNode.Content[0].Style)
+	require.Equal(t, "# winning occurrence", newNode.Content[1].LineComment)
+	require.Equal(t, "# tail", newNode.Content[3].LineComment)
+}
+
 func TestJSONPatchRejectsDuplicateDefinedOperationMembers(t *testing.T) {
 	tests := []string{
 		`[{"op":"remove","op":"add","path":"/added","value":2}]`,

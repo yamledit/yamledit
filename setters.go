@@ -267,7 +267,14 @@ func upsertScalarKey(mapNode *yaml.Node, key, tag, val string) {
 				// will still be rejected by Marshal.
 				mapNode.Content[i+1] = &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: val}
 			} else {
+				oldKind := mapNode.Content[i+1].Kind
 				setScalarNode(mapNode.Content[i+1], tag, val)
+				if (oldKind == yaml.MappingNode || oldKind == yaml.SequenceNode) && k.LineComment != "" {
+					if mapNode.Content[i+1].LineComment == "" {
+						mapNode.Content[i+1].LineComment = k.LineComment
+					}
+					k.LineComment = ""
+				}
 			}
 			updated = true
 		}
@@ -918,9 +925,13 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 		return
 	}
 	var oldNode *yaml.Node
+	var retainedKeyNode *yaml.Node
+	retainedPairIndex := -1
 	for index := len(mapNode.Content) - 2; index >= 0; index -= 2 {
 		if isStringMappingKey(mapNode.Content[index], key) {
+			retainedKeyNode = mapNode.Content[index]
 			oldNode = mapNode.Content[index+1]
+			retainedPairIndex = index
 			break
 		}
 	}
@@ -933,17 +944,40 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 	var updatedOrdered gyaml.MapSlice
 	if st != nil {
 		fullTokens := append(append([]ptrToken(nil), pathTokens...), ptrToken{key: key})
-		recordNodeReplacementIntentLocked(st, tokenPathSegments(fullTokens), oldNode, signatureOfYAMLNode(valueNode))
-		base := st.ordered
-		// setNodeValue removes every duplicate string-key occurrence from the
-		// AST, so remove logical duplicates before appending the replacement.
-		if withoutOld, err := orderedRemoveAtPathTokens(base, fullTokens); err == nil {
-			base = withoutOld
-		}
 		var err error
-		updatedOrdered, err = orderedUpsertAtPathTokens(base, fullTokens, orderedValue)
+		updatedOrdered, err = orderedReplaceAtPathTokens(st.ordered, fullTokens, orderedValue)
 		if err != nil {
 			return
+		}
+		fullPath := tokenPathSegments(fullTokens)
+		recordNodeReplacementIntentLocked(st, fullPath, oldNode, signatureOfYAMLNode(valueNode))
+		markWholeCollectionReplacementIntentLocked(st, fullPath)
+	}
+	if oldNode != nil {
+		if valueNode.HeadComment == "" {
+			valueNode.HeadComment = oldNode.HeadComment
+		}
+		if valueNode.LineComment == "" {
+			valueNode.LineComment = oldNode.LineComment
+		}
+		if valueNode.FootComment == "" {
+			valueNode.FootComment = oldNode.FootComment
+		}
+		if valueNode.Line == 0 {
+			valueNode.Line = oldNode.Line
+		}
+		if valueNode.Column == 0 {
+			valueNode.Column = oldNode.Column
+		}
+		if oldNode.Kind == yaml.ScalarNode &&
+			(valueNode.Kind == yaml.MappingNode || valueNode.Kind == yaml.SequenceNode) &&
+			len(valueNode.Content) > 0 && oldNode.LineComment != "" {
+			if retainedKeyNode != nil && retainedKeyNode.LineComment == "" {
+				retainedKeyNode.LineComment = oldNode.LineComment
+			}
+			if valueNode.LineComment == oldNode.LineComment {
+				valueNode.LineComment = ""
+			}
 		}
 	}
 
@@ -952,17 +986,11 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 		// and tag deliberately come from valueNode: SetValue replaces a custom-
 		// tagged value with the ordinary tag of the requested Go collection.
 		anchor := oldNode.Anchor
-		headComment := oldNode.HeadComment
-		lineComment := oldNode.LineComment
-		footComment := oldNode.FootComment
 		line := oldNode.Line
 		column := oldNode.Column
 
 		*oldNode = *valueNode
 		oldNode.Anchor = anchor
-		oldNode.HeadComment = headComment
-		oldNode.LineComment = lineComment
-		oldNode.FootComment = footComment
 		oldNode.Line = line
 		oldNode.Column = column
 		valueNode = oldNode
@@ -973,10 +1001,11 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 	for i := 0; i+1 < len(mapNode.Content); i += 2 {
 		keyNode := mapNode.Content[i]
 		if isStringMappingKey(keyNode, key) {
-			// Keep an anchored replacement at its original mapping position. Moving
-			// it to the end could put a pre-existing alias before its anchor, which
-			// changes valid YAML into an invalid forward reference.
-			if reuseAnchoredNode && mapNode.Content[i+1] == oldNode {
+			// Replacing an existing key retains the last occurrence's mapping
+			// position while earlier duplicates are removed. Besides matching the
+			// public ordering contract, this keeps an anchored replacement before
+			// any aliases that already refer to it.
+			if i == retainedPairIndex {
 				nextContent = append(nextContent, keyNode, valueNode)
 				replacementInserted = true
 			}
@@ -1003,6 +1032,81 @@ func setNodeValue(mapNode *yaml.Node, key string, valueNode *yaml.Node, orderedV
 		}
 	}
 	recordExpectedASTLocked(st)
+}
+
+// orderedReplaceAtPathTokens replaces the final mapping member while retaining
+// its position and removing earlier duplicate occurrences. A missing final key
+// is appended. Intermediate containers must already exist.
+func orderedReplaceAtPathTokens(ms gyaml.MapSlice, path []ptrToken, value interface{}) (gyaml.MapSlice, error) {
+	if len(path) == 0 {
+		return ms, fmt.Errorf("orderedReplaceAtPath: empty path")
+	}
+	var recur func(interface{}, int) (interface{}, error)
+	recur = func(current interface{}, depth int) (interface{}, error) {
+		token := path[depth]
+		switch container := current.(type) {
+		case gyaml.MapSlice:
+			last := -1
+			for index := len(container) - 1; index >= 0; index-- {
+				if keyEquals(container[index].Key, token.key) {
+					last = index
+					break
+				}
+			}
+			if depth == len(path)-1 {
+				if last < 0 {
+					return append(container, gyaml.MapItem{Key: token.key, Value: value}), nil
+				}
+				replaced := make(gyaml.MapSlice, 0, len(container))
+				for index, item := range container {
+					if keyEquals(item.Key, token.key) {
+						if index == last {
+							item.Value = value
+							replaced = append(replaced, item)
+						}
+						continue
+					}
+					replaced = append(replaced, item)
+				}
+				return replaced, nil
+			}
+			if last < 0 {
+				return nil, fmt.Errorf("orderedReplaceAtPath: key %q not found", token.key)
+			}
+			next, err := recur(container[last].Value, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			container[last].Value = next
+			return container, nil
+		case []interface{}:
+			if !token.isIdx || token.append || token.index < 0 || token.index >= len(container) {
+				return nil, fmt.Errorf("orderedReplaceAtPath: invalid sequence index at segment %d", depth)
+			}
+			if depth == len(path)-1 {
+				container[token.index] = value
+				return container, nil
+			}
+			next, err := recur(container[token.index], depth+1)
+			if err != nil {
+				return nil, err
+			}
+			container[token.index] = next
+			return container, nil
+		default:
+			return nil, fmt.Errorf("orderedReplaceAtPath: unexpected type at segment %d (%T)", depth, current)
+		}
+	}
+
+	updated, err := recur(ms, 0)
+	if err != nil {
+		return ms, err
+	}
+	result, ok := updated.(gyaml.MapSlice)
+	if !ok {
+		return ms, fmt.Errorf("orderedReplaceAtPath: root changed to %T", updated)
+	}
+	return result, nil
 }
 
 const (
@@ -1136,6 +1240,8 @@ func (n *setValueNormalizer) normalize(value any, opts SetValueOptions, depth in
 		return uint64(v)
 	case uint64:
 		return v
+	case uintptr:
+		return uint64(v)
 	case float32:
 		return float64(v)
 	case float64, bool, string, nil:

@@ -178,7 +178,10 @@ func TestComplexMutationHistoryFallsBackToCompleteTypedRewrite(t *testing.T) {
 
 	var reparsed yaml.Node
 	require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
-	itemValue := reparsed.Content[0].Content[3].Content[0].Content[3]
+	items := mappingValueForStringKey(t, reparsed.Content[0], "items")
+	require.Equal(t, yaml.SequenceNode, items.Kind, "output:\n%s", out)
+	require.Len(t, items.Content, 1, "output:\n%s", out)
+	itemValue := mappingValueForStringKey(t, items.Content[0], "value")
 	require.Equal(t, "!!float", itemValue.Tag, "output:\n%s", out)
 	require.Equal(t, "1e999", itemValue.Value, "output:\n%s", out)
 	require.Contains(t, string(out), "# target")

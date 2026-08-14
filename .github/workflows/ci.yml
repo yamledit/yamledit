@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.24.1', stable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go.sum
+      - run: go test ./... -count=1
+      - run: go vet ./...
+
+  formatting:
+    name: Formatting and generated-file hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+      - name: Check gofmt
+        shell: bash
+        run: test -z "$(gofmt -l -- *.go)"
+      - name: Check changed lines for whitespace errors
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE_SHA: ${{ github.event.before }}
+        run: |
+          zero=0000000000000000000000000000000000000000
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git diff --check "$PR_BASE_SHA...HEAD"
+          elif [[ -n "$PUSH_BASE_SHA" && "$PUSH_BASE_SHA" != "$zero" ]]; then
+            git diff --check "$PUSH_BASE_SHA..HEAD"
+          else
+            git show --check --format= HEAD
+          fi
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+      - run: go test -race ./... -count=1
+
+  shuffle:
+    name: Shuffled tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+      - run: go test ./... -shuffle=on -count=10
+
+  fuzz-smoke:
+    name: Fuzz seed and smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+      - name: Run fuzz seed corpus as tests
+        run: go test ./... -run '^Fuzz' -count=1
+      - name: Run each fuzz target briefly
+        shell: bash
+        run: |
+          mapfile -t targets < <(go test -list '^Fuzz' | grep '^Fuzz')
+          test "${#targets[@]}" -gt 0
+          for target in "${targets[@]}"; do
+            go test -run '^$' -fuzz "^${target}$" -fuzztime=5s
+          done
+
+  benchmark-smoke:
+    name: Benchmark smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache-dependency-path: go.sum
+      - run: go test -run '^$' -bench '^Benchmark' -benchtime=1x ./...

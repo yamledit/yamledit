@@ -691,6 +691,293 @@ func yamlNodeToInterfaceSeen(n *yaml.Node, visiting map[*yaml.Node]bool, budget 
 	}
 }
 
+func lastStringMappingEntryIndexes(node *yaml.Node) map[string]int {
+	if node == nil {
+		return nil
+	}
+	indexes := make(map[string]int, len(node.Content)/2)
+
+	// Walk paired mapping entries in reverse so the first index recorded for a
+	// key is its semantically winning last occurrence. Derive an even starting
+	// index so a malformed trailing key without a value is ignored just as it is
+	// by the forward mapping walks in this file.
+	start := len(node.Content) - 2
+	if start >= 0 && start%2 != 0 {
+		start--
+	}
+	for index := start; index >= 0; index -= 2 {
+		key := node.Content[index]
+		if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+			continue
+		}
+		if _, exists := indexes[key.Value]; !exists {
+			indexes[key.Value] = index
+		}
+	}
+	return indexes
+}
+
+type sequencePresentationCandidate struct {
+	index int
+	value interface{}
+}
+
+// replacementPresentationFingerprint groups values that can be equal under
+// deepEqual. It is only an index key: callers must still compare candidates to
+// make hash collisions harmless. The encoding mirrors deepEqual's numeric
+// normalization and order-independent string-keyed mapping comparison.
+func replacementPresentationFingerprint(value interface{}) uint64 {
+	const (
+		fnvOffset64 = uint64(14695981039346656037)
+		fnvPrime64  = uint64(1099511628211)
+	)
+
+	hash := fnvOffset64
+	writeByte := func(value byte) {
+		hash ^= uint64(value)
+		hash *= fnvPrime64
+	}
+	writeUint64 := func(value uint64) {
+		for shift := uint(0); shift < 64; shift += 8 {
+			writeByte(byte(value >> shift))
+		}
+	}
+	writeString := func(value string) {
+		writeUint64(uint64(len(value)))
+		for index := 0; index < len(value); index++ {
+			writeByte(value[index])
+		}
+	}
+
+	// Sequence reconciliation passes yamlNodeToInterface results, whose nested
+	// maps and slices are already plain. Retain one top-level normalization for
+	// consistency with deepEqual without repeatedly walking every subtree.
+	value = toPlain(value)
+	var visit func(interface{})
+	visit = func(value interface{}) {
+		if decimal, ok := canonicalDecimal(value); ok {
+			writeByte('n')
+			if decimal.negative {
+				writeByte(1)
+			} else {
+				writeByte(0)
+			}
+			writeString(decimal.digits)
+			writeString(decimal.scale)
+			return
+		}
+
+		switch typed := value.(type) {
+		case nil:
+			writeByte('0')
+		case bool:
+			writeByte('b')
+			if typed {
+				writeByte(1)
+			} else {
+				writeByte(0)
+			}
+		case string:
+			writeByte('s')
+			writeString(typed)
+		case map[string]interface{}:
+			writeByte('m')
+			writeUint64(uint64(len(typed)))
+			keys := make([]string, 0, len(typed))
+			for key := range typed {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				writeString(key)
+				visit(typed[key])
+			}
+		case []interface{}:
+			writeByte('a')
+			writeUint64(uint64(len(typed)))
+			for _, item := range typed {
+				visit(item)
+			}
+		case unsupportedJSONValue:
+			writeByte('x')
+			writeString(typed.reason)
+		default:
+			// yamlNodeToInterface currently emits only the cases above. Keep an
+			// equality-safe fallback for future types: values of the same type share
+			// a bucket and deepEqual performs the authoritative comparison.
+			writeByte('u')
+			writeString(fmt.Sprintf("%T", typed))
+		}
+	}
+
+	visit(value)
+	return hash
+}
+
+// reconcileReplacementPresentation applies the package's key-order and comment
+// policy to a JSON Patch replacement. JSON object order is not semantic, so
+// members retained from the source keep their order and presentation while new
+// members are appended in the deterministic order of the decoded JSON value.
+// Tags and anchors are deliberately not copied here: replacement tag intent and
+// alias validation remain authoritative.
+func reconcileReplacementPresentation(oldNode, newNode *yaml.Node) {
+	if oldNode == nil || newNode == nil {
+		return
+	}
+	if newNode.HeadComment == "" {
+		newNode.HeadComment = oldNode.HeadComment
+	}
+	if newNode.LineComment == "" {
+		newNode.LineComment = oldNode.LineComment
+	}
+	if newNode.FootComment == "" {
+		newNode.FootComment = oldNode.FootComment
+	}
+	if oldNode.Kind != newNode.Kind || oldNode.Tag != newNode.Tag {
+		return
+	}
+	if deepEqual(yamlNodeToInterface(oldNode), yamlNodeToInterface(newNode)) {
+		newNode.Style = oldNode.Style
+	}
+
+	switch newNode.Kind {
+	case yaml.MappingNode:
+		newByKey := lastStringMappingEntryIndexes(newNode)
+		oldByKey := lastStringMappingEntryIndexes(oldNode)
+		used := make(map[string]struct{}, len(newByKey))
+		reordered := make([]*yaml.Node, 0, len(newNode.Content))
+		for index := 0; index+1 < len(oldNode.Content); index += 2 {
+			oldKey := oldNode.Content[index]
+			if oldKey == nil || oldKey.Kind != yaml.ScalarNode || oldKey.Tag != "!!str" {
+				continue
+			}
+			newIndex, exists := newByKey[oldKey.Value]
+			if !exists {
+				continue
+			}
+			// Earlier source duplicates are not retained by JSON object semantics;
+			// the reverse index identifies the winning occurrence in constant time.
+			if oldByKey[oldKey.Value] != index {
+				continue
+			}
+			newKey, newValue := newNode.Content[newIndex], newNode.Content[newIndex+1]
+			reconcileReplacementPresentation(oldKey, newKey)
+			reconcileReplacementPresentation(oldNode.Content[index+1], newValue)
+			reordered = append(reordered, newKey, newValue)
+			used[oldKey.Value] = struct{}{}
+		}
+		for index := 0; index+1 < len(newNode.Content); index += 2 {
+			key := newNode.Content[index]
+			if key != nil && key.Kind == yaml.ScalarNode && key.Tag == "!!str" {
+				if _, exists := used[key.Value]; exists {
+					continue
+				}
+			}
+			reordered = append(reordered, key, newNode.Content[index+1])
+		}
+		newNode.Content = reordered
+	case yaml.SequenceNode:
+		// Mapping records with a unique scalar "name" field retain presentation
+		// independently of their index; other values are matched uniquely by their
+		// logical JSON value.
+		identity := func(node *yaml.Node) (string, bool) {
+			if node == nil || node.Kind != yaml.MappingNode {
+				return "", false
+			}
+			for index := len(node.Content) - 2; index >= 0; index -= 2 {
+				if isStringMappingKey(node.Content[index], "name") {
+					value := node.Content[index+1]
+					if value != nil && value.Kind == yaml.ScalarNode {
+						return value.Value, true
+					}
+				}
+			}
+			return "", false
+		}
+		oldByIdentity := make(map[string][]int, len(oldNode.Content))
+		oldByLogicalValue := make(map[uint64][]sequencePresentationCandidate, len(oldNode.Content))
+		usedOld := make(map[int]struct{}, len(newNode.Content))
+		var mappingTemplate *yaml.Node
+		for index, original := range oldNode.Content {
+			if original != nil && original.Kind == yaml.MappingNode {
+				if mappingTemplate == nil {
+					mappingTemplate = original
+				}
+			}
+			if name, ok := identity(original); ok {
+				oldByIdentity[name] = append(oldByIdentity[name], index)
+			}
+			value := yamlNodeToInterface(original)
+			fingerprint := replacementPresentationFingerprint(value)
+			oldByLogicalValue[fingerprint] = append(oldByLogicalValue[fingerprint], sequencePresentationCandidate{
+				index: index,
+				value: value,
+			})
+		}
+		reorderFromTemplate := func(template, current *yaml.Node) {
+			if template == nil || current == nil || template.Kind != yaml.MappingNode || current.Kind != yaml.MappingNode {
+				return
+			}
+			byKey := lastStringMappingEntryIndexes(current)
+			used := make(map[string]struct{}, len(byKey))
+			reordered := make([]*yaml.Node, 0, len(current.Content))
+			for index := 0; index+1 < len(template.Content); index += 2 {
+				key := template.Content[index]
+				if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+					continue
+				}
+				currentIndex, exists := byKey[key.Value]
+				if !exists {
+					continue
+				}
+				reordered = append(reordered, current.Content[currentIndex], current.Content[currentIndex+1])
+				used[key.Value] = struct{}{}
+			}
+			for index := 0; index+1 < len(current.Content); index += 2 {
+				key := current.Content[index]
+				if key != nil && key.Kind == yaml.ScalarNode && key.Tag == "!!str" {
+					if _, exists := used[key.Value]; exists {
+						continue
+					}
+				}
+				reordered = append(reordered, key, current.Content[index+1])
+			}
+			current.Content = reordered
+		}
+		for _, current := range newNode.Content {
+			match, matchCount := -1, 0
+			if name, ok := identity(current); ok {
+				matches := oldByIdentity[name]
+				matchCount = len(matches)
+				if matchCount == 1 {
+					match = matches[0]
+				}
+			} else {
+				currentValue := yamlNodeToInterface(current)
+				fingerprint := replacementPresentationFingerprint(currentValue)
+				for _, candidate := range oldByLogicalValue[fingerprint] {
+					if deepEqual(candidate.value, currentValue) {
+						match = candidate.index
+						matchCount++
+						if matchCount > 1 {
+							break
+						}
+					}
+				}
+			}
+			if matchCount != 1 {
+				reorderFromTemplate(mappingTemplate, current)
+				continue
+			}
+			if _, duplicate := usedOld[match]; duplicate {
+				continue
+			}
+			usedOld[match] = struct{}{}
+			reconcileReplacementPresentation(oldNode.Content[match], current)
+		}
+	}
+}
+
 type unsupportedJSONValue struct {
 	reason string
 }
@@ -935,6 +1222,7 @@ func rebaseNodeRewriteIntentsForSequence(st *docState, sequencePath []string, in
 				continue
 			}
 			intent.target = yamlNodeSignature{}
+			intent.automaticNormalization = false
 			// Preserve an explicit tombstone even when this path was previously
 			// created during the same edit history. A subsequent add at the same
 			// index is a replacement of the original source occupant for output
@@ -1296,6 +1584,13 @@ func opRemove(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []p
 			return fmt.Errorf("yamledit: remove: update ordered map: %w", updateErr)
 		}
 		if hasRemovedPath {
+			// Use the same exact deletion-marker lifecycle as DeleteKey. Besides
+			// driving source deletion, this lets a later add at the same mapping path
+			// restore the removed entry's comments into the live AST exactly once.
+			if st.toDelete == nil {
+				st.toDelete = make(map[string]struct{})
+			}
+			st.toDelete[joinPath(removedPath)] = struct{}{}
 			clearForcedScalarIntentAtOrBelow(st, removedPath)
 		}
 	}
@@ -1337,6 +1632,10 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 			return fmt.Errorf("yamledit: replace: index %d out of bounds", last.index)
 		}
 		old := parent.Content[last.index]
+		reconcileReplacementPresentation(old, yval)
+		if reconciled, reconcileErr := yamlNodeToOrderedValue(yval); reconcileErr == nil {
+			orderedVal = reconciled
+		}
 		if hasDestinationPath {
 			markPatchScalarTagChange(st, destinationPath, old, orderedVal)
 			recordNodeReplacementIntentLocked(st, destinationPath, old, signatureOfYAMLNode(yval))
@@ -1433,6 +1732,10 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 				oldKind := yaml.Kind(0)
 				oldLineComment := ""
 				if oldChild != nil {
+					reconcileReplacementPresentation(oldChild, yval)
+					if reconciled, reconcileErr := yamlNodeToOrderedValue(yval); reconcileErr == nil {
+						orderedVal = reconciled
+					}
 					oldKind = oldChild.Kind
 					oldLineComment = oldChild.LineComment
 					yval.Anchor = oldChild.Anchor
@@ -1450,7 +1753,10 @@ func opReplace(start *yaml.Node, st *docState, docHN *yaml.Node, baseFromRoot []
 						if parent.Content[i].LineComment == "" {
 							parent.Content[i].LineComment = oldLineComment
 						}
-						oldChild.LineComment = ""
+						// Clear the node installed in the mapping. For an unanchored
+						// replacement oldChild is detached, while an anchored replacement
+						// keeps that pointer in parent.Content.
+						parent.Content[i+1].LineComment = ""
 					}
 				}
 				found = true

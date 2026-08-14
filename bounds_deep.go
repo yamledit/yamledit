@@ -27,6 +27,55 @@ func indexBoundsByPathKeyDeep(original []byte, doc *yaml.Node) (map[string][]kvB
 	return out, unsafe, opaque
 }
 
+// indexNonReproduciblePaths records addressable regions containing source
+// syntax that yaml.v3 resolves into ordinary Node fields but cannot emit again.
+// Keep this separate from opaque paths: live-AST rewriting is exactly what makes
+// most opaque presentation safe, whereas a bare non-specific `!` property is
+// absent from the live graph and must block automatic ancestor promotion.
+func indexNonReproduciblePaths(original []byte, doc *yaml.Node) map[string]struct{} {
+	root := doc
+	if root != nil && root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	lineOffsets := buildLineOffsets(original)
+	paths := make(map[string]struct{})
+	mark := func(path []string) {
+		for depth := 1; depth <= len(path); depth++ {
+			paths[joinPath(path[:depth])] = struct{}{}
+		}
+	}
+	var walk func(*yaml.Node, []string)
+	walk = func(node *yaml.Node, path []string) {
+		if node == nil {
+			return
+		}
+		if nodeHasNonSpecificTag(original, lineOffsets, node) {
+			mark(path)
+		}
+		switch node.Kind {
+		case yaml.MappingNode:
+			for index := 0; index+1 < len(node.Content); index += 2 {
+				key, value := node.Content[index], node.Content[index+1]
+				if key == nil || key.Kind != yaml.ScalarNode {
+					continue
+				}
+				childPath := append(append([]string(nil), path...), key.Value)
+				if nodeHasNonSpecificTag(original, lineOffsets, key) {
+					mark(childPath)
+				}
+				walk(value, childPath)
+			}
+		case yaml.SequenceNode:
+			for index, child := range node.Content {
+				childPath := append(append([]string(nil), path...), indexSeg(index))
+				walk(child, childPath)
+			}
+		}
+	}
+	walk(root, nil)
+	return paths
+}
+
 func walkBoundsDeep(original []byte, lineOffsets []int, node *yaml.Node, prefix []string, out map[string][]kvBounds, unsafe, opaque map[string]struct{}, inheritedUnsafe, insideFlow bool) {
 	if node == nil {
 		return
@@ -95,6 +144,17 @@ func walkBoundsDeep(original []byte, lineOffsets []int, node *yaml.Node, prefix 
 				b, ok := boundsForMappingEntry(original, lineOffsets, k, v)
 				if ok {
 					b.anchor = v.Anchor
+					// yaml.v3 recognizes comments immediately following a completed
+					// flow collection or quoted scalar even without intervening space.
+					// Preserve parser metadata for this entry line instead of asking the
+					// lightweight scanner to guess whether an embedded '#' starts a
+					// comment. A collection value may also carry a comment from a later
+					// child line, which must not be hoisted onto the key line.
+					if k.LineComment != "" {
+						b.lineComment = k.LineComment
+					} else if v.Line == k.Line {
+						b.lineComment = v.LineComment
+					}
 					if (v.Kind == yaml.MappingNode && v.Tag != "!!map") || (v.Kind == yaml.SequenceNode && v.Tag != "!!seq") {
 						b.collectionTag = v.Tag
 					}
@@ -215,6 +275,14 @@ func markLivePresentationOpaquePaths(node *yaml.Node, prefix []string, opaque ma
 				continue
 			}
 			next := append(append([]string(nil), prefix...), key.Value)
+			// Re-rendering an entire entry from the ordered shadow cannot preserve
+			// presentation attached to the key node itself. Scalar token surgery is
+			// still safe because it leaves the key bytes untouched; structural
+			// rewrites must fail or promote rather than silently drop this metadata.
+			if key.Anchor != "" || key.Style != 0 ||
+				(key.Tag != "" && key.Tag != "!!str") || key.HeadComment != "" || key.FootComment != "" {
+				opaque[joinPath(next)] = struct{}{}
+			}
 			if hasPresentation(key) {
 				markAncestors(next)
 			}

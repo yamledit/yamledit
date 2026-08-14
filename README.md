@@ -112,6 +112,8 @@ env:
 
 * `Parse(data []byte) (*yaml.Node, error)`
   Parse bytes into a `yaml.Node`. Top‑level **must** be a mapping (empty input creates an empty mapping document).
+  Every mapping key must be represented directly by a YAML scalar node; collection and alias keys are rejected because
+  the package's path/index model cannot address them safely.
 
 * `Marshal(doc *yaml.Node) ([]byte, error)`
   Serialize back to bytes. Edits made through this package use byte surgery or a scoped per-key/sequence rewrite; if
@@ -222,6 +224,9 @@ out, _ := yamledit.Marshal(doc)
   preserved rather than risking removal of neighboring content.
 * **Booleans normalize on edit.** A key you edit with `SetScalarBool` (or via JSON Patch) will render as bare `true`/
   `false` even if previously quoted. Unrelated booleans remain untouched.
+* **Implicit empty maps materialize.** An untagged blank mapping value such as `config:` is treated as an empty mapping
+  and may marshal as `config: {}`. If materializing it inside flow YAML would discard source-only metadata that cannot
+  be reproduced safely, `Marshal` returns an error.
 * **No global re‑encode for package edits.** Mutations made through `EnsurePath`, setters, `DeleteKey`, or JSON Patch use
   surgery or per-key/sequence rewrites based on recorded bounds. If those are unsafe, `Marshal` returns an error.
   Direct field changes to the returned `yaml.Node` are the exception: because they bypass the edit index, `Marshal`
@@ -273,11 +278,18 @@ go test ./...
 
 ## Performance
 
-Edits run in O(changes), indexing is O(file). Memory footprint scales with the size of the original buffer and indices 
-(line offsets, map/sequence metadata).
+Parsing and indexing are linear in document size. A registered mutation may locate its target and snapshot the full
+document, and `Marshal` validates the complete live/output graph. Bulk helpers repeat mutation work per field, sorting
+`k` map keys adds O(k log k), and presentation reconciliation depends on the changed collection; total cost is therefore
+not merely O(changes). Memory use scales with the source buffer, AST/shadow snapshots, and source indices.
+
+The benchmark suite provides allocation-aware small and large cases for Parse, no-op Marshal, scalar surgery,
+structural and sequence replacement, multi-operation JSON Patch, and wide mapping/sequence presentation reconciliation.
 
 ---
 
 ## License
 
-MIT
+The README historically identified this project as MIT-licensed, but the
+repository does not yet contain a `LICENSE` file. The maintainer must confirm
+the license text and copyright notice before a release is published.

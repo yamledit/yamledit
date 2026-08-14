@@ -56,6 +56,11 @@ type docState struct {
 	boundsByPathKey map[string][]kvBounds
 	unsafePathKeys  map[string]struct{}
 	opaquePathKeys  map[string]struct{} // container rewrites would lose source-only metadata
+	// nonReproduciblePathKeys marks source regions containing syntax that yaml.v3
+	// resolves but cannot faithfully emit again (currently the bare non-specific
+	// `!` property). Automatic parse normalization must not promote a rewrite
+	// through one of these regions.
+	nonReproduciblePathKeys map[string]struct{}
 
 	seqIndex map[string]*seqInfo // sequence formatting & anchors by YAML path
 	// forceScalarRewrite records scalar paths whose requested YAML tag changed
@@ -85,8 +90,11 @@ type yamlNodeSignature struct {
 }
 
 type nodeRewriteIntent struct {
-	origin yamlNodeSignature
-	target yamlNodeSignature
+	origin                     yamlNodeSignature
+	target                     yamlNodeSignature
+	removedDuringEdits         bool
+	wholeCollectionReplacement bool
+	automaticNormalization     bool
 }
 
 func signatureOfYAMLNode(node *yaml.Node) yamlNodeSignature {
@@ -118,6 +126,11 @@ func recordNodeReplacementIntentLocked(st *docState, path []string, old *yaml.No
 		intent.origin = signatureOfYAMLNode(old)
 	}
 	intent.target = target
+	// Ordinary replacements preserve any source presentation that remains
+	// compatible with the requested kind/tag. Whole collection replacement and
+	// parse-time flow normalization opt into a whole-value rewrite separately.
+	intent.wholeCollectionReplacement = false
+	intent.automaticNormalization = false
 	st.nodeRewriteIntents[encoded] = intent
 
 	// Replacing a container also replaces every descendant. Preserve each
@@ -130,9 +143,45 @@ func recordNodeReplacementIntentLocked(st *docState, path []string, old *yaml.No
 		segments, ok := splitJoinedPath(descendant)
 		if ok && len(segments) > len(path) && pathSegmentsEqual(segments[:len(path)], path) {
 			childIntent.target = yamlNodeSignature{}
+			childIntent.automaticNormalization = false
 			st.nodeRewriteIntents[descendant] = childIntent
 		}
 	}
+}
+
+// markWholeCollectionReplacementIntentLocked records that a complete mapping
+// or sequence was replaced rather than edited descendant-by-descendant. The
+// replacement is therefore authoritative even when source and target have the
+// same YAML kind and tag (for example SetValue with SortKeys).
+func markWholeCollectionReplacementIntentLocked(st *docState, path []string) {
+	if st == nil || len(path) == 0 {
+		return
+	}
+	encoded := joinPath(path)
+	intent, ok := st.nodeRewriteIntents[encoded]
+	if !ok || !intent.target.exists ||
+		(intent.target.kind != yaml.MappingNode && intent.target.kind != yaml.SequenceNode) {
+		return
+	}
+	intent.wholeCollectionReplacement = true
+	st.nodeRewriteIntents[encoded] = intent
+}
+
+// markAutomaticNormalizationIntentLocked marks the whole-node replacement
+// created only by Parse when it materializes an implicit null inside a flow
+// collection. Later public replacement/removal recorders clear this provenance.
+func markAutomaticNormalizationIntentLocked(st *docState, path []string) {
+	if st == nil || len(path) == 0 {
+		return
+	}
+	encoded := joinPath(path)
+	intent, ok := st.nodeRewriteIntents[encoded]
+	if !ok || !intent.target.exists || intent.target.kind != yaml.MappingNode || intent.target.tag != "!!map" {
+		return
+	}
+	intent.wholeCollectionReplacement = true
+	intent.automaticNormalization = true
+	st.nodeRewriteIntents[encoded] = intent
 }
 
 func recordNodeRemovalIntentLocked(st *docState, path []string, old *yaml.Node) {
@@ -148,11 +197,15 @@ func recordNodeRemovalIntentLocked(st *docState, path []string, old *yaml.Node) 
 		intent.origin = signatureOfYAMLNode(old)
 	}
 	intent.target = yamlNodeSignature{}
+	intent.removedDuringEdits = true
+	intent.wholeCollectionReplacement = false
+	intent.automaticNormalization = false
 	st.nodeRewriteIntents[encoded] = intent
 	for descendant, childIntent := range st.nodeRewriteIntents {
 		segments, ok := splitJoinedPath(descendant)
 		if ok && len(segments) > len(path) && pathSegmentsEqual(segments[:len(path)], path) {
 			childIntent.target = yamlNodeSignature{}
+			childIntent.automaticNormalization = false
 			st.nodeRewriteIntents[descendant] = childIntent
 		}
 	}
@@ -184,15 +237,31 @@ func recordShiftedSubtreeIntentsLocked(st *docState, path []string, shifted *yam
 		original, exists := yamlNodeAtPathSegments(originalRoot, currentPath)
 		encoded := joinPath(currentPath)
 		if exists {
-			st.nodeRewriteIntents[encoded] = nodeRewriteIntent{
+			intent := nodeRewriteIntent{
 				origin: signatureOfYAMLNode(original),
 				target: signatureOfYAMLNode(current),
 			}
+			if previous, ok := st.nodeRewriteIntents[encoded]; ok {
+				intent.removedDuringEdits = previous.removedDuringEdits
+				intent.wholeCollectionReplacement = previous.wholeCollectionReplacement
+				intent.automaticNormalization = previous.automaticNormalization
+			}
+			st.nodeRewriteIntents[encoded] = intent
 		} else {
 			// No source node occupies this final path (for example an append beyond
-			// the original sequence length). Any rebased history here belongs to a
-			// different item and must not constrain the new subtree.
-			delete(st.nodeRewriteIntents, encoded)
+			// the original sequence length). Ordinary rebased history belongs to a
+			// different item and must not constrain the new subtree. A mapping-entry
+			// reinsertion marker is different: it follows the same live item and may
+			// move back onto an original index after a transient insertion is removed.
+			// Retain lifecycle/provenance that follows the same logical item and
+			// refresh its live target while it is parked beyond the source sequence.
+			if previous, ok := st.nodeRewriteIntents[encoded]; ok &&
+				(previous.removedDuringEdits || previous.automaticNormalization) {
+				previous.target = signatureOfYAMLNode(current)
+				st.nodeRewriteIntents[encoded] = previous
+			} else {
+				delete(st.nodeRewriteIntents, encoded)
+			}
 		}
 		switch current.Kind {
 		case yaml.MappingNode:
@@ -279,7 +348,8 @@ func activeNodeRewriteIntentsLocked(st *docState, root *yaml.Node) map[string]ya
 			originalRoot = originalRoot.Content[0]
 		}
 		original, existedOriginally := yamlNodeAtPathSegments(originalRoot, path)
-		if !existedOriginally || sameYAMLNodeSignature(signatureOfYAMLNode(original), intent.target) {
+		if !existedOriginally ||
+			(sameYAMLNodeSignature(signatureOfYAMLNode(original), intent.target) && !intent.wholeCollectionReplacement) {
 			continue
 		}
 		if !intent.origin.exists {
@@ -292,6 +362,164 @@ func activeNodeRewriteIntentsLocked(st *docState, root *yaml.Node) map[string]ya
 		active[encoded] = intent.target
 	}
 	return active
+}
+
+// activeAutomaticNormalizationIntentsLocked filters the already-validated live
+// rewrite targets down to replacements created automatically by Parse.
+// The caller must hold st.mu.
+func activeAutomaticNormalizationIntentsLocked(st *docState, active map[string]yamlNodeSignature) map[string]struct{} {
+	normalized := make(map[string]struct{})
+	if st == nil {
+		return normalized
+	}
+	for encoded := range active {
+		if intent, ok := st.nodeRewriteIntents[encoded]; ok && intent.automaticNormalization {
+			normalized[encoded] = struct{}{}
+		}
+	}
+	return normalized
+}
+
+// activeMappingReinsertionsLocked returns original mapping entries that were
+// removed and later recreated. Their live AST position is authoritative: they
+// are new keys for ordering purposes and must not be patched back into their
+// old source slot. Sequence item removals are handled by sequence surgery, so
+// only mapping-entry paths are collected here.
+func activeMappingReinsertionsLocked(st *docState, root *yaml.Node) []string {
+	if st == nil || root == nil {
+		return nil
+	}
+	originalRoot := st.originalAST
+	if originalRoot != nil && originalRoot.Kind == yaml.DocumentNode && len(originalRoot.Content) == 1 {
+		originalRoot = originalRoot.Content[0]
+	}
+	marked := make(map[string]struct{})
+	for encoded, intent := range st.nodeRewriteIntents {
+		if !intent.removedDuringEdits || !intent.target.exists {
+			continue
+		}
+		path, ok := splitJoinedPath(encoded)
+		if !ok || len(path) == 0 || isIndexPathSegment(path[len(path)-1]) {
+			continue
+		}
+		current, exists := yamlNodeAtPathSegments(root, path)
+		if !exists || !sameYAMLNodeSignature(signatureOfYAMLNode(current), intent.target) {
+			continue
+		}
+		if _, existedOriginally := yamlNodeAtPathSegments(originalRoot, path); !existedOriginally {
+			continue
+		}
+		marked[encoded] = struct{}{}
+	}
+	if len(marked) == 0 {
+		return nil
+	}
+
+	var ordered []string
+	selected := make(map[string]struct{})
+	var walk func(*yaml.Node, []string)
+	walk = func(node *yaml.Node, path []string) {
+		if node == nil {
+			return
+		}
+		switch node.Kind {
+		case yaml.MappingNode:
+			for index := 0; index+1 < len(node.Content); index += 2 {
+				key, value := node.Content[index], node.Content[index+1]
+				if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+					continue
+				}
+				childPath := append(append([]string(nil), path...), key.Value)
+				encoded := joinPath(childPath)
+				if _, exists := marked[encoded]; exists {
+					covered := false
+					for depth := len(childPath) - 1; depth >= 1; depth-- {
+						if _, ancestor := selected[joinPath(childPath[:depth])]; ancestor {
+							covered = true
+							break
+						}
+					}
+					if !covered {
+						ordered = append(ordered, encoded)
+						selected[encoded] = struct{}{}
+					}
+				}
+				walk(value, childPath)
+			}
+		case yaml.SequenceNode:
+			for index, child := range node.Content {
+				childPath := append(append([]string(nil), path...), indexSeg(index))
+				walk(child, childPath)
+			}
+		}
+	}
+	walk(root, nil)
+	return ordered
+}
+
+// restoreRecreatedMappingEntryCommentsLocked keeps the package's comment
+// preservation guarantee when a mapping key is removed and recreated before
+// Marshal. The recreated value keeps its requested kind/tag/style; only comment
+// fields attached to the original key and value nodes are restored.
+func restoreRecreatedMappingEntryCommentsLocked(st *docState, path []string) {
+	if st == nil || len(path) == 0 {
+		return
+	}
+	liveRoot := st.root()
+	if liveRoot == nil || liveRoot.Kind != yaml.DocumentNode || len(liveRoot.Content) != 1 {
+		return
+	}
+	liveRoot = liveRoot.Content[0]
+	originalRoot := st.originalAST
+	if originalRoot == nil {
+		return
+	}
+	if originalRoot.Kind == yaml.DocumentNode && len(originalRoot.Content) == 1 {
+		originalRoot = originalRoot.Content[0]
+	}
+	liveParent, liveExists := yamlNodeAtPathSegments(liveRoot, path[:len(path)-1])
+	originalParent, originalExists := yamlNodeAtPathSegments(originalRoot, path[:len(path)-1])
+	if !liveExists || !originalExists || liveParent.Kind != yaml.MappingNode || originalParent.Kind != yaml.MappingNode {
+		return
+	}
+	key := path[len(path)-1]
+	findPair := func(mapping *yaml.Node) (*yaml.Node, *yaml.Node) {
+		for index := len(mapping.Content) - 2; index >= 0; index -= 2 {
+			if isStringMappingKey(mapping.Content[index], key) {
+				return mapping.Content[index], mapping.Content[index+1]
+			}
+		}
+		return nil, nil
+	}
+	liveKey, liveValue := findPair(liveParent)
+	originalKey, originalValue := findPair(originalParent)
+	copyComments := func(destination, source *yaml.Node) {
+		if destination == nil || source == nil {
+			return
+		}
+		if destination.HeadComment == "" {
+			destination.HeadComment = source.HeadComment
+		}
+		if destination.LineComment == "" {
+			destination.LineComment = source.LineComment
+		}
+		if destination.FootComment == "" {
+			destination.FootComment = source.FootComment
+		}
+	}
+	copyComments(liveKey, originalKey)
+	if originalValue != nil && originalValue.Kind == yaml.ScalarNode && liveValue != nil &&
+		(liveValue.Kind == yaml.MappingNode || liveValue.Kind == yaml.SequenceNode) && len(liveValue.Content) > 0 {
+		lineComment := originalValue.LineComment
+		originalWithoutLineComment := cloneYAMLNodeGraph(originalValue)
+		originalWithoutLineComment.LineComment = ""
+		copyComments(liveValue, originalWithoutLineComment)
+		if liveKey != nil && liveKey.LineComment == "" {
+			liveKey.LineComment = lineComment
+		}
+	} else {
+		copyComments(liveValue, originalValue)
+	}
 }
 
 // hasNodeRewriteIntentAtOrBelow reports whether an edit explicitly replaced the
@@ -332,6 +560,7 @@ type kvBounds struct {
 	end           int // exclusive end offset of the block (includes trailing newline if present)
 	anchor        string
 	collectionTag string // explicit/custom tag on a mapping or sequence value
+	lineComment   string // parser-recognized inline comment on the original entry
 }
 
 type seqInfo struct {

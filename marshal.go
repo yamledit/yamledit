@@ -187,6 +187,10 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	for path := range st.opaquePathKeys {
 		semanticOpaquePaths[path] = struct{}{}
 	}
+	nonReproduciblePaths := make(map[string]struct{}, len(st.nonReproduciblePathKeys))
+	for path := range st.nonReproduciblePathKeys {
+		nonReproduciblePaths[path] = struct{}{}
+	}
 	opaquePaths := make(map[string]struct{}, len(semanticOpaquePaths))
 	for path := range semanticOpaquePaths {
 		opaquePaths[path] = struct{}{}
@@ -203,6 +207,8 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	delSet := make(map[string]struct{}, len(st.toDelete))
 	forceScalarRewrite := make(map[string]struct{}, len(st.forceScalarRewrite))
 	nodeRewriteTargets := activeNodeRewriteIntentsLocked(st, doc.Content[0])
+	normalizationRewriteTargets := activeAutomaticNormalizationIntentsLocked(st, nodeRewriteTargets)
+	mappingReinsertions := activeMappingReinsertionsLocked(st, doc.Content[0])
 	seqIdx := cloneSeqIndex(st.seqIndex)
 	for k := range st.toDelete {
 		delSet[k] = struct{}{}
@@ -230,7 +236,11 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 	rootMappingEmpty := doc != nil && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0
 	st.mu.RUnlock()
 
-	out, okPatch := marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, unsafePaths, semanticOpaquePaths, presentationOpaquePaths, indent, delSet, forceScalarRewrite)
+	var out []byte
+	okPatch := false
+	if len(mappingReinsertions) == 0 {
+		out, okPatch = marshalBySurgery(original, ordered, origOrdered, mapIdx, valIdx, seqIdx, boundsIdx, unsafePaths, semanticOpaquePaths, presentationOpaquePaths, indent, delSet, forceScalarRewrite)
+	}
 	var surgicalValidationErr error
 	if okPatch {
 		validated, err := validateEditedOutputWithNodeIntents(out, nodeRewriteTargets, semanticExpected)
@@ -244,7 +254,7 @@ func Marshal(doc *yaml.Node) ([]byte, error) {
 		surgicalValidationErr = err
 	}
 
-	if patched, ok := structuralRewrite(original, ordered, origOrdered, liveRootSnapshot, boundsIdx, unsafePaths, opaquePaths, indent, delSet, forceScalarRewrite, nodeRewriteTargets, rootMappingEmpty); ok {
+	if patched, ok := structuralRewrite(original, ordered, origOrdered, liveRootSnapshot, boundsIdx, unsafePaths, opaquePaths, nonReproduciblePaths, indent, delSet, forceScalarRewrite, nodeRewriteTargets, normalizationRewriteTargets, mappingReinsertions, rootMappingEmpty); ok {
 		return validateEditedOutputWithNodeIntents(patched, nodeRewriteTargets, semanticExpected)
 	}
 	if surgicalValidationErr != nil {
@@ -272,7 +282,7 @@ func validateEditedOutputWithNodeIntents(out []byte, intents map[string]yamlNode
 			return nil, fmt.Errorf("yamledit: cannot verify edited YAML semantics: %w", err)
 		}
 		actualMap, ok := actual.(gyaml.MapSlice)
-		if !ok || !logicalEqualOrdered(expected[0], actualMap) {
+		if !ok || !logicalOutputEqual(expected[0], actualMap) {
 			return nil, fmt.Errorf("yamledit: edit would not preserve the requested YAML values and types")
 		}
 	}
@@ -288,6 +298,63 @@ func validateEditedOutputWithNodeIntents(out []byte, intents map[string]yamlNode
 		}
 	}
 	return out, nil
+}
+
+// logicalOutputEqual validates values, scalar categories, mapping order, and
+// sequence order. At each mapping level it permits the one documented
+// normalization: earlier duplicate string-key occurrences may be removed while
+// the retained last occurrences stay in order.
+func logicalOutputEqual(expected, actual interface{}) bool {
+	switch want := expected.(type) {
+	case gyaml.MapSlice:
+		got, ok := actual.(gyaml.MapSlice)
+		if !ok {
+			return false
+		}
+		compare := func(left, right gyaml.MapSlice) bool {
+			if len(left) != len(right) {
+				return false
+			}
+			for index := range left {
+				if !keyEquals(left[index].Key, fmt.Sprint(right[index].Key)) ||
+					!logicalOutputEqual(left[index].Value, right[index].Value) {
+					return false
+				}
+			}
+			return true
+		}
+		if compare(want, got) {
+			return true
+		}
+		retained := make(gyaml.MapSlice, 0, len(want))
+		for index, item := range want {
+			key := fmt.Sprint(item.Key)
+			shadowed := false
+			for later := index + 1; later < len(want); later++ {
+				if keyEquals(want[later].Key, key) {
+					shadowed = true
+					break
+				}
+			}
+			if !shadowed {
+				retained = append(retained, item)
+			}
+		}
+		return compare(retained, got)
+	case []interface{}:
+		got, ok := actual.([]interface{})
+		if !ok || len(want) != len(got) {
+			return false
+		}
+		for index := range want {
+			if !logicalOutputEqual(want[index], got[index]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return logicalValueEqual(expected, actual)
+	}
 }
 
 // yamlNodeGraphEqual compares the complete serializable YAML graph. Source
@@ -351,7 +418,7 @@ func standardEncode(doc *yaml.Node, indent int) ([]byte, error) {
 }
 
 // structuralRewrite surgically re-encodes individual key regions using boundsIdx.
-func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, liveRoot *yaml.Node, boundsIdx map[string][]kvBounds, unsafePaths, opaquePaths map[string]struct{}, baseIndent int, delSet, forceScalarRewrite map[string]struct{}, nodeRewriteTargets map[string]yamlNodeSignature, rootMappingEmpty bool) ([]byte, bool) {
+func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyaml.MapSlice, liveRoot *yaml.Node, boundsIdx map[string][]kvBounds, unsafePaths, opaquePaths, nonReproduciblePaths map[string]struct{}, baseIndent int, delSet, forceScalarRewrite map[string]struct{}, nodeRewriteTargets map[string]yamlNodeSignature, normalizationRewriteTargets map[string]struct{}, mappingReinsertions []string, rootMappingEmpty bool) ([]byte, bool) {
 	if rootMappingEmpty && len(ordered) == 0 && len(origOrdered) > 0 {
 		for pk := range unsafePaths {
 			if parts, ok := splitJoinedPath(pk); ok && len(parts) == 1 {
@@ -392,6 +459,18 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 	var patches []patch
 	patched := map[string]struct{}{}
 	changed := collectChangedKeysDeep(origOrdered, ordered, nil)
+	reinsertSet := make(map[string]struct{}, len(mappingReinsertions))
+	changedInitially := make(map[string]struct{}, len(changed)+len(mappingReinsertions))
+	for _, path := range changed {
+		changedInitially[path] = struct{}{}
+	}
+	for _, path := range mappingReinsertions {
+		reinsertSet[path] = struct{}{}
+		if _, exists := changedInitially[path]; !exists {
+			changed = append(changed, path)
+			changedInitially[path] = struct{}{}
+		}
+	}
 	for pk := range forceScalarRewrite {
 		changed = append(changed, pk)
 	}
@@ -405,10 +484,22 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		if !ok {
 			return nil, false
 		}
+		// Automatic parse normalization must not promote through source syntax
+		// that yaml.v3 cannot reproduce. Intentional public replacements and
+		// ordinary live-AST rewrites retain the existing opaque-path behavior.
+		_, automaticNormalization := normalizationRewriteTargets[encoded]
 		for depth := len(segments); depth >= 1; depth-- {
 			ancestor := joinPath(segments[:depth])
 			if len(boundsIdx[ancestor]) == 0 {
 				continue
+			}
+			// A bare non-specific `!` is resolved but not retained as an emitter
+			// token. Exact-path replacements remain intentional; automatic ancestor
+			// promotion must fail closed instead of rewriting that untouched syntax.
+			if automaticNormalization && depth < len(segments) {
+				if _, nonReproducible := nonReproduciblePaths[ancestor]; nonReproducible {
+					return nil, false
+				}
 			}
 			if depth == len(segments) {
 				if _, unsafe := unsafePaths[ancestor]; !unsafe {
@@ -419,6 +510,38 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 			}
 			liveRewritePaths[ancestor] = struct{}{}
 			changed = append(changed, ancestor)
+			break
+		}
+	}
+	// Moving a mapping member inside a sequence item can move the item's dash
+	// from one key to another. Independent delete/insert patches cannot express
+	// that safely, so rewrite the nearest bounded mapping entry from the live AST.
+	for _, encoded := range mappingReinsertions {
+		segments, ok := splitJoinedPath(encoded)
+		if !ok {
+			return nil, false
+		}
+		insideSequence := false
+		for _, segment := range segments[:len(segments)-1] {
+			if isIndexPathSegment(segment) {
+				insideSequence = true
+				break
+			}
+		}
+		if !insideSequence {
+			continue
+		}
+		for depth := len(segments) - 1; depth >= 1; depth-- {
+			if isIndexPathSegment(segments[depth-1]) {
+				continue
+			}
+			ancestor := joinPath(segments[:depth])
+			if len(boundsIdx[ancestor]) == 0 {
+				continue
+			}
+			liveRewritePaths[ancestor] = struct{}{}
+			changed = append(changed, ancestor)
+			delete(reinsertSet, encoded)
 			break
 		}
 	}
@@ -560,6 +683,20 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		patched[pk] = struct{}{}
 		rewritten[pk] = struct{}{}
 	}
+	// A mapping key removed and later recreated is a new entry for ordering
+	// purposes. Delete every old source occurrence now, then let the insertion
+	// pass emit the live value at its final mapping position.
+	for _, pk := range mappingReinsertions {
+		if _, active := reinsertSet[pk]; !active {
+			continue
+		}
+		if _, unsafe := unsafePaths[pk]; unsafe {
+			return nil, false
+		}
+		for _, bound := range boundsIdx[pk] {
+			patches = append(patches, patch{start: bound.start, end: bound.end})
+		}
+	}
 
 	// Scoped structural rewrite must honor last-wins duplicate semantics too.
 	// Keep only widest ranges so a duplicate parent removal subsumes any
@@ -608,11 +745,28 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 			}
 			return nil, false
 		}
+		if _, reinsert := reinsertSet[pk]; reinsert {
+			if hasRewrittenAncestor(pk) {
+				continue
+			}
+			if _, exists := insertSet[pk]; !exists {
+				insertCands = append(insertCands, pk)
+				insertSet[pk] = struct{}{}
+			}
+			continue
+		}
 		bounds := boundsIdx[pk]
 		if len(bounds) == 0 {
 			// Candidate for insertion – but only if not already covered by
 			// a rewrite patch of an ancestor.
 			if hasRewrittenAncestor(pk) {
+				continue
+			}
+			// A path can appear more than once in changed: for example, changing
+			// the value of a newly inserted key also records a scalar tag intent.
+			// Zero-width insertion patches do not overlap, so the patch filter
+			// cannot deduplicate them later. Emit each logical key exactly once.
+			if _, exists := insertSet[pk]; exists {
 				continue
 			}
 			insertCands = append(insertCands, pk)
@@ -705,6 +859,41 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 		}
 		inserts = append(inserts, pk)
 	}
+	// Multiple zero-width insertions at one source anchor must follow the final
+	// live mapping order, including a recreated key interleaved with other new
+	// keys during a multi-operation edit history.
+	liveOrder := make(map[string]int)
+	order := 0
+	var indexLiveOrder func(*yaml.Node, []string)
+	indexLiveOrder = func(node *yaml.Node, path []string) {
+		if node == nil {
+			return
+		}
+		switch node.Kind {
+		case yaml.MappingNode:
+			for index := 0; index+1 < len(node.Content); index += 2 {
+				key, value := node.Content[index], node.Content[index+1]
+				if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+					continue
+				}
+				childPath := append(append([]string(nil), path...), key.Value)
+				liveOrder[joinPath(childPath)] = order
+				order++
+				indexLiveOrder(value, childPath)
+			}
+		case yaml.SequenceNode:
+			for index, child := range node.Content {
+				childPath := append(append([]string(nil), path...), indexSeg(index))
+				indexLiveOrder(child, childPath)
+			}
+		}
+	}
+	indexLiveOrder(liveRoot, nil)
+	sort.SliceStable(inserts, func(left, right int) bool {
+		leftRank, leftExists := liveOrder[inserts[left]]
+		rightRank, rightExists := liveOrder[inserts[right]]
+		return leftExists && rightExists && leftRank < rightRank
+	})
 
 	// Emit insertion patches (start==end).
 	seenInsertPos := map[int]bool{}
@@ -737,7 +926,17 @@ func structuralRewrite(original []byte, ordered gyaml.MapSlice, origOrdered gyam
 			seenInsertPos[insertPos] = true
 		}
 
-		if !renderInsertedKeyValue(&sb, key, val, indentSpaces, baseIndent) {
+		if _, reinsert := reinsertSet[pk]; reinsert {
+			bounds := boundsIdx[pk]
+			if len(bounds) == 0 {
+				return nil, false
+			}
+			rendered, ok := renderKeyValue(original, key, val, bounds[len(bounds)-1], baseIndent, append(parentPath, key), nodeRewriteTargets)
+			if !ok {
+				return nil, false
+			}
+			sb.WriteString(rendered)
+		} else if !renderInsertedKeyValue(&sb, key, val, indentSpaces, baseIndent) {
 			return nil, false
 		}
 		patches = append(patches, patch{start: insertPos, end: insertPos, data: []byte(sb.String())})
@@ -995,7 +1194,10 @@ func renderKeyValue(original []byte, key string, val interface{}, b kvBounds, ba
 		first := leadingSpaces(line)
 		inlineSequenceKey = first+1 < len(line) && line[first] == '-' && (line[first+1] == ' ' || line[first+1] == '\t')
 	}
-	comment := inlineComment(original, b.start)
+	comment := b.lineComment
+	if comment == "" {
+		comment = inlineComment(original, b.start)
+	}
 
 	for i := range lines {
 		linePrefix := prefix
@@ -1051,6 +1253,9 @@ func yamlCommentStart(line []byte) int {
 	inSingle := false
 	inDouble := false
 	escaped := false
+	plainActive := false
+	propertyToken := false
+	atTokenStart := true
 	for i := 0; i < len(line); i++ {
 		c := line[i]
 		if inDouble {
@@ -1062,6 +1267,8 @@ func yamlCommentStart(line []byte) int {
 				escaped = true
 			} else if c == '"' {
 				inDouble = false
+				plainActive = true
+				atTokenStart = false
 			}
 			continue
 		}
@@ -1072,18 +1279,71 @@ func yamlCommentStart(line []byte) int {
 					continue
 				}
 				inSingle = false
+				plainActive = true
+				atTokenStart = false
+			}
+			continue
+		}
+		if c == '#' && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t') {
+			return i
+		}
+		if c == ' ' || c == '\t' {
+			if propertyToken {
+				plainActive = false
+				propertyToken = false
+				atTokenStart = true
+			} else if !plainActive {
+				atTokenStart = true
 			}
 			continue
 		}
 		switch c {
 		case '"':
-			inDouble = true
-		case '\'':
-			inSingle = true
-		case '#':
-			if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
-				return i
+			if atTokenStart && !plainActive {
+				inDouble = true
+			} else {
+				plainActive = true
+				atTokenStart = false
 			}
+		case '\'':
+			if atTokenStart && !plainActive {
+				inSingle = true
+			} else {
+				plainActive = true
+				atTokenStart = false
+			}
+		case '[', ']', '{', '}', ',':
+			plainActive = false
+			propertyToken = false
+			atTokenStart = true
+		case ':':
+			nextIsSeparator := i+1 == len(line) || line[i+1] == ' ' || line[i+1] == '\t' ||
+				line[i+1] == ',' || line[i+1] == ']' || line[i+1] == '}'
+			if nextIsSeparator {
+				plainActive = false
+				propertyToken = false
+				atTokenStart = true
+			} else {
+				plainActive = true
+				atTokenStart = false
+			}
+		case '-', '?':
+			if atTokenStart && i+1 < len(line) && (line[i+1] == ' ' || line[i+1] == '\t') {
+				plainActive = false
+				atTokenStart = true
+			} else {
+				plainActive = true
+				atTokenStart = false
+			}
+		case '!', '&':
+			if atTokenStart && !plainActive {
+				propertyToken = true
+			}
+			plainActive = true
+			atTokenStart = false
+		default:
+			plainActive = true
+			atTokenStart = false
 		}
 	}
 	return -1
@@ -1289,7 +1549,10 @@ func renderSequenceValue(original []byte, key string, val interface{}, b kvBound
 		return "", false
 	}
 	indentSpaces := currentIndent(original, b.start)
-	comment := inlineComment(original, b.start)
+	comment := b.lineComment
+	if comment == "" {
+		comment = inlineComment(original, b.start)
+	}
 
 	var sb strings.Builder
 	sb.WriteString(strings.Repeat(" ", indentSpaces))

@@ -500,6 +500,127 @@ func hasStrictScalarPrefixAppend(oldArr, newArr []interface{}) bool {
 	return true
 }
 
+// orderedArrayAtMappingPath resolves a sequence stored under key in a nested
+// ordered mapping. The ordered shadow uses last-key-wins semantics, so both
+// traversal and lookup scan from the end.
+func orderedArrayAtMappingPath(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool) {
+	current := ms
+	for _, segment := range path {
+		found := false
+		for index := len(current) - 1; index >= 0; index-- {
+			name, ok := current[index].Key.(string)
+			if !ok || name != segment {
+				continue
+			}
+			nested, ok := current[index].Value.(gyaml.MapSlice)
+			if !ok {
+				return nil, false
+			}
+			current = nested
+			found = true
+			break
+		}
+		if !found {
+			return nil, false
+		}
+	}
+	for index := len(current) - 1; index >= 0; index-- {
+		name, ok := current[index].Key.(string)
+		if !ok || name != key {
+			continue
+		}
+		sequence, ok := current[index].Value.([]interface{})
+		return sequence, ok
+	}
+	return nil, false
+}
+
+func sequenceItemMapSlice(value interface{}) (gyaml.MapSlice, bool) {
+	switch typed := value.(type) {
+	case gyaml.MapSlice:
+		return typed, true
+	case map[string]interface{}:
+		ordered, ok := jsonValueToOrdered(typed).(gyaml.MapSlice)
+		return ordered, ok
+	default:
+		return nil, false
+	}
+}
+
+func renderSequenceScalar(value interface{}) string {
+	if rendered, ok := renderScalarToken(value); ok {
+		return rendered
+	}
+	return quoteNewStringToken(fmt.Sprint(value))
+}
+
+// renderSequenceMappingItem is shared by append and whole-sequence rewrite.
+// Keeping one renderer is important: key ordering, duplicate-key collapse,
+// compact dash layout, and nested-value indentation must not drift between the
+// two surgery paths.
+func renderSequenceMappingItem(si *seqInfo, mapping gyaml.MapSlice, baseIndent int) (string, bool) {
+	values := make(map[string]interface{}, len(mapping))
+	for _, item := range mapping {
+		if key, ok := item.Key.(string); ok {
+			values[key] = item.Value
+		}
+	}
+
+	order := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	appendKey := func(key string) {
+		if _, present := values[key]; !present {
+			return
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return
+		}
+		order = append(order, key)
+		seen[key] = struct{}{}
+	}
+	for _, key := range si.keyOrder {
+		appendKey(key)
+	}
+	for _, item := range mapping {
+		if key, ok := item.Key.(string); ok {
+			appendKey(key)
+		}
+	}
+	if len(order) == 0 {
+		return "", false
+	}
+
+	keyIndent := si.itemKVIndent
+	if keyIndent == 0 {
+		keyIndent = si.indent + baseIndent
+	}
+	first := order[0]
+	firstValue := values[first]
+
+	var output strings.Builder
+	if si.firstKeyInline && isScalarValue(firstValue) {
+		writeYAMLIndent(&output, si.indent)
+		output.WriteString("- ")
+		output.WriteString(renderMappingKey(first))
+		output.WriteString(": ")
+		output.WriteString(renderSequenceScalar(firstValue))
+		output.WriteByte('\n')
+	} else {
+		writeYAMLIndent(&output, si.indent)
+		output.WriteString("-\n")
+		if !renderInsertedKeyValue(&output, first, firstValue, keyIndent, baseIndent) {
+			return "", false
+		}
+	}
+
+	for _, key := range order[1:] {
+		if !renderInsertedKeyValue(&output, key, values[key], keyIndent, baseIndent) {
+			return "", false
+		}
+	}
+	return output.String(), true
+}
+
 // Build patches for appending new items to sequences (arrays) at the end.
 // 'skipSeq' contains sequence paths (joinPath form) which are already replaced entirely.
 func buildSeqAppendPatches(
@@ -510,151 +631,7 @@ func buildSeqAppendPatches(
 	baseIndent int,
 	skipSeq map[string]struct{},
 ) (bool, []patch) {
-	_ = seqIdx // retained in the signature for compatibility with the surgery pipeline
 	var patches []patch
-
-	var getArrAtPath func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool)
-	getArrAtPath = func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool) {
-		// navigate to mapping at path
-		cur := ms
-		for _, seg := range path {
-			found := false
-			for i := len(cur) - 1; i >= 0; i-- {
-				ks, ok := cur[i].Key.(string)
-				if ok && ks == seg {
-					if sub, ok2 := cur[i].Value.(gyaml.MapSlice); ok2 {
-						cur = sub
-						found = true
-						break
-					}
-				}
-			}
-			if !found {
-				return nil, false
-			}
-		}
-		for i := len(cur) - 1; i >= 0; i-- {
-			ks, ok := cur[i].Key.(string)
-			if ok && ks == key {
-				if arr, ok2 := cur[i].Value.([]interface{}); ok2 {
-					return arr, true
-				}
-				return nil, false
-			}
-		}
-		return nil, false
-	}
-
-	var toMapSlice = func(v interface{}) (gyaml.MapSlice, bool) {
-		switch t := v.(type) {
-		case gyaml.MapSlice:
-			return t, true
-		case map[string]interface{}:
-			ms := gyaml.MapSlice{}
-			for k, vv := range t {
-				ms = append(ms, gyaml.MapItem{Key: k, Value: jsonValueToOrdered(vv)})
-			}
-			return ms, true
-		default:
-			return gyaml.MapSlice{}, false
-		}
-	}
-
-	renderScalar := func(v interface{}) string {
-		if rendered, ok := renderScalarToken(v); ok {
-			return rendered
-		}
-		return quoteNewStringToken(fmt.Sprint(v))
-	}
-
-	renderItem := func(si *seqInfo, ms gyaml.MapSlice) (string, bool) {
-		// Build lookup and order
-		vals := map[string]interface{}{}
-		for _, it := range ms {
-			if ks, ok := it.Key.(string); ok {
-				vals[ks] = it.Value
-			}
-		}
-		order := []string{}
-		seenOrder := map[string]struct{}{}
-		if len(si.keyOrder) > 0 {
-			for _, key := range si.keyOrder {
-				_, seen := seenOrder[key]
-				if _, present := vals[key]; present && !seen {
-					order = append(order, key)
-					seenOrder[key] = struct{}{}
-				}
-			}
-			for _, it := range ms {
-				ks, ok := it.Key.(string)
-				if !ok {
-					continue
-				}
-				if _, seen := seenOrder[ks]; !seen {
-					order = append(order, ks)
-					seenOrder[ks] = struct{}{}
-				}
-			}
-		} else {
-			for _, it := range ms {
-				if ks, ok := it.Key.(string); ok {
-					if _, seen := seenOrder[ks]; !seen {
-						order = append(order, ks)
-						seenOrder[ks] = struct{}{}
-					}
-				}
-			}
-		}
-		if len(order) == 0 {
-			return "", false
-		}
-
-		kvIndent := si.itemKVIndent
-		if kvIndent == 0 {
-			kvIndent = si.indent + baseIndent
-		}
-
-		var sb strings.Builder
-
-		first := order[0]
-		fv, ok := vals[first]
-		if !ok {
-			return "", false
-		}
-
-		if si.firstKeyInline && isScalarValue(fv) {
-			// Standard inline form: "- key: value"
-			sb.WriteString(strings.Repeat(" ", si.indent))
-			sb.WriteString("- ")
-			sb.WriteString(renderMappingKey(first))
-			sb.WriteString(": ")
-			sb.WriteString(renderScalar(fv))
-			sb.WriteString("\n")
-		} else {
-			// Either originally non-inline, or first value is now complex (e.g. a nested list).
-			// Render as:
-			//   -
-			//     key: ...
-			sb.WriteString(strings.Repeat(" ", si.indent))
-			sb.WriteString("-\n")
-			if !renderInsertedKeyValue(&sb, first, fv, kvIndent, baseIndent) {
-				return "", false
-			}
-		}
-
-		for i := 1; i < len(order); i++ {
-			k := order[i]
-			v, ok := vals[k]
-			if !ok {
-				continue
-			}
-			if !renderInsertedKeyValue(&sb, k, v, kvIndent, baseIndent) {
-				return "", false
-			}
-		}
-
-		return sb.String(), true
-	}
 
 	var walk func(ms gyaml.MapSlice, path []string) bool
 	walk = func(ms gyaml.MapSlice, path []string) bool {
@@ -676,7 +653,7 @@ func buildSeqAppendPatches(
 				if _, skip := skipSeq[mpath]; skip {
 					continue
 				}
-				origArr, ok := getArrAtPath(originalOrdered, path, k)
+				origArr, ok := orderedArrayAtMappingPath(originalOrdered, path, k)
 				if !ok {
 					// This is a brand-new sequence (no original anchor). We don't try
 					// to surgically append into it here; insertion of the entire key
@@ -714,11 +691,11 @@ func buildSeqAppendPatches(
 					switch el := v[i].(type) {
 					case gyaml.MapSlice, map[string]interface{}:
 						// existing mapping rendering path
-						msItem, ok := toMapSlice(v[i])
+						msItem, ok := sequenceItemMapSlice(v[i])
 						if !ok {
 							return false
 						}
-						txt, ok := renderItem(si, msItem)
+						txt, ok := renderSequenceMappingItem(si, msItem, baseIndent)
 						if !ok {
 							return false
 						}
@@ -731,7 +708,7 @@ func buildSeqAppendPatches(
 						// scalar append: "- <scalar>\n" honoring original indent
 						sb.WriteString(strings.Repeat(" ", si.indent))
 						sb.WriteString("- ")
-						sb.WriteString(renderScalar(el))
+						sb.WriteString(renderSequenceScalar(el))
 						sb.WriteString("\n")
 					}
 					// advance anchor for chaining multiple appends in same sequence
@@ -1371,52 +1348,6 @@ func buildSeqReplaceBlockPatches(
 ) (bool, []patch, map[string]struct{}) {
 	var patches []patch
 	replaced := map[string]struct{}{}
-
-	var getArrAtPath func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool)
-	getArrAtPath = func(ms gyaml.MapSlice, path []string, key string) ([]interface{}, bool) {
-		cur := ms
-		for _, seg := range path {
-			found := false
-			for i := len(cur) - 1; i >= 0; i-- {
-				ks, ok := cur[i].Key.(string)
-				if ok && ks == seg {
-					if sub, ok2 := cur[i].Value.(gyaml.MapSlice); ok2 {
-						cur = sub
-						found = true
-						break
-					}
-				}
-			}
-			if !found {
-				return nil, false
-			}
-		}
-		for i := len(cur) - 1; i >= 0; i-- {
-			ks, ok := cur[i].Key.(string)
-			if ok && ks == key {
-				if arr, ok2 := cur[i].Value.([]interface{}); ok2 {
-					return arr, true
-				}
-				return nil, false
-			}
-		}
-		return nil, false
-	}
-
-	toMapSlice := func(v interface{}) (gyaml.MapSlice, bool) {
-		switch t := v.(type) {
-		case gyaml.MapSlice:
-			return t, true
-		case map[string]interface{}:
-			ms := gyaml.MapSlice{}
-			for k, vv := range t {
-				ms = append(ms, gyaml.MapItem{Key: k, Value: jsonValueToOrdered(vv)})
-			}
-			return ms, true
-		default:
-			return gyaml.MapSlice{}, false
-		}
-	}
 	// Helper to convert scalar interface{} to string for identity matching.
 	// Must be consistent with how yaml.v3 parses values into Node.Value during indexing.
 	scalarToString := func(v interface{}) (string, bool) {
@@ -1494,7 +1425,7 @@ func buildSeqReplaceBlockPatches(
 	}
 
 	getItemIdentity := func(item interface{}) (string, bool) {
-		if ms, ok := toMapSlice(item); ok {
+		if ms, ok := sequenceItemMapSlice(item); ok {
 			for _, it := range ms {
 				if ks, ok := it.Key.(string); ok && ks == "name" {
 					return scalarToString(it.Value)
@@ -1506,96 +1437,6 @@ func buildSeqReplaceBlockPatches(
 			return "", false
 		}
 		return scalarToString(item)
-	}
-
-	renderScalar := func(v interface{}) string {
-		if rendered, ok := renderScalarToken(v); ok {
-			return rendered
-		}
-		return quoteNewStringToken(fmt.Sprint(v))
-	}
-
-	renderItem := func(si *seqInfo, ms gyaml.MapSlice) (string, bool) {
-		vals := map[string]interface{}{}
-		for _, it := range ms {
-			if ks, ok := it.Key.(string); ok {
-				vals[ks] = it.Value
-			}
-		}
-		order := []string{}
-		seenOrder := map[string]struct{}{}
-		if len(si.keyOrder) > 0 {
-			for _, key := range si.keyOrder {
-				_, seen := seenOrder[key]
-				if _, present := vals[key]; present && !seen {
-					order = append(order, key)
-					seenOrder[key] = struct{}{}
-				}
-			}
-			for _, it := range ms {
-				ks, ok := it.Key.(string)
-				if !ok {
-					continue
-				}
-				if _, seen := seenOrder[ks]; !seen {
-					order = append(order, ks)
-					seenOrder[ks] = struct{}{}
-				}
-			}
-		} else {
-			for _, it := range ms {
-				if ks, ok := it.Key.(string); ok {
-					if _, seen := seenOrder[ks]; !seen {
-						order = append(order, ks)
-						seenOrder[ks] = struct{}{}
-					}
-				}
-			}
-		}
-		if len(order) == 0 {
-			return "", false
-		}
-
-		kvIndent := si.itemKVIndent
-		if kvIndent == 0 {
-			kvIndent = si.indent + baseIndent
-		}
-
-		var sb strings.Builder
-
-		first := order[0]
-		fv, ok := vals[first]
-		if !ok {
-			return "", false
-		}
-
-		if si.firstKeyInline && isScalarValue(fv) {
-			sb.WriteString(strings.Repeat(" ", si.indent))
-			sb.WriteString("- ")
-			sb.WriteString(renderMappingKey(first))
-			sb.WriteString(": ")
-			sb.WriteString(renderScalar(fv))
-			sb.WriteString("\n")
-		} else {
-			sb.WriteString(strings.Repeat(" ", si.indent))
-			sb.WriteString("-\n")
-			if !renderInsertedKeyValue(&sb, first, fv, kvIndent, baseIndent) {
-				return "", false
-			}
-		}
-
-		for i := 1; i < len(order); i++ {
-			k := order[i]
-			v, ok := vals[k]
-			if !ok {
-				continue
-			}
-			if !renderInsertedKeyValue(&sb, k, v, kvIndent, baseIndent) {
-				return "", false
-			}
-		}
-
-		return sb.String(), true
 	}
 
 	// shapeChanged reports whether the "shape" of a sequence is different:
@@ -1650,11 +1491,11 @@ func buildSeqReplaceBlockPatches(
 		// rewrite merely because the mapping has no conventional "name" key.
 		allMappings := true
 		for i := range oldArr {
-			if _, oldOK := toMapSlice(oldArr[i]); !oldOK {
+			if _, oldOK := sequenceItemMapSlice(oldArr[i]); !oldOK {
 				allMappings = false
 				break
 			}
-			if _, newOK := toMapSlice(newArr[i]); !newOK {
+			if _, newOK := sequenceItemMapSlice(newArr[i]); !newOK {
 				allMappings = false
 				break
 			}
@@ -1684,7 +1525,7 @@ func buildSeqReplaceBlockPatches(
 					return false
 				}
 			case []interface{}:
-				origArr, ok := getArrAtPath(originalOrdered, path, k)
+				origArr, ok := orderedArrayAtMappingPath(originalOrdered, path, k)
 				if !ok {
 					// New array; cannot perform surgical block replace as we don't have anchors.
 					continue
@@ -1722,14 +1563,35 @@ func buildSeqReplaceBlockPatches(
 				seqPath := append(append([]string{}, path...), k)
 				if _, presentationOpaque := presentationOpaquePaths[mpath]; presentationOpaque {
 					// Presentation metadata is safe during a pure append because all
-					// original items are reused byte-for-byte. Same-length scalar edits
-					// are also safe when every changed item has a precise token bound.
+					// original items are reused byte-for-byte. An append combined with
+					// scalar prefix edits is also safe when every changed item has a
+					// precise token bound; those replacements are emitted independently.
 					safe := len(v) >= len(origArr)
 					if safe {
 						for i := range origArr {
-							if !logicalValueEqual(origArr[i], v[i]) {
+							if logicalValueEqual(origArr[i], v[i]) {
+								continue
+							}
+							if !isScalarValue(origArr[i]) || !isScalarValue(v[i]) {
 								safe = false
 								break
+							}
+							occs := valIdx[makeSeqItemPathKey(seqPath, i)]
+							if len(occs) == 0 {
+								safe = false
+								break
+							}
+							occ := occs[len(occs)-1]
+							if occ.blockStyle || occ.multiline {
+								safe = false
+								break
+							}
+							if occ.explicitTag {
+								tag, ok := scalarYAMLTag(v[i])
+								if !ok || tag != occ.tag {
+									safe = false
+									break
+								}
 							}
 						}
 					}
@@ -1947,7 +1809,7 @@ func buildSeqReplaceBlockPatches(
 											newValBytes = stringReplacementToken(oldTok, sval)
 										} else {
 											// Use canonical rendering for non-strings.
-											newValBytes = []byte(renderScalar(el))
+											newValBytes = []byte(renderSequenceScalar(el))
 										}
 										sb.Write(newValBytes)
 
@@ -1974,9 +1836,9 @@ func buildSeqReplaceBlockPatches(
 					}
 
 					// Re-render the item.
-					if msItem, okMap := toMapSlice(el); okMap {
+					if msItem, okMap := sequenceItemMapSlice(el); okMap {
 						// Render mapping item
-						txt, ok := renderItem(si, msItem)
+						txt, ok := renderSequenceMappingItem(si, msItem, baseIndent)
 						if !ok {
 							return false
 						}
@@ -1989,7 +1851,7 @@ func buildSeqReplaceBlockPatches(
 						// Render scalar item (Fallback rendering)
 						sb.WriteString(strings.Repeat(" ", si.indent))
 						sb.WriteString("- ")
-						sb.WriteString(renderScalar(el))
+						sb.WriteString(renderSequenceScalar(el))
 						sb.WriteString("\n")
 					}
 				} // end loop

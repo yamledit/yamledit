@@ -42,6 +42,36 @@ func isYAMLTriviaOnly(data []byte) bool {
 	return true
 }
 
+func validateParsedMappingKeys(root *yaml.Node) error {
+	seen := make(map[*yaml.Node]struct{})
+	stack := []*yaml.Node{root}
+	for len(stack) > 0 {
+		last := len(stack) - 1
+		node := stack[last]
+		stack = stack[:last]
+		if node == nil {
+			continue
+		}
+		if _, exists := seen[node]; exists {
+			continue
+		}
+		seen[node] = struct{}{}
+		if node.Kind == yaml.MappingNode {
+			for index := 0; index+1 < len(node.Content); index += 2 {
+				key := node.Content[index]
+				if key == nil || key.Kind != yaml.ScalarNode {
+					return fmt.Errorf("complex YAML mapping keys are not supported")
+				}
+			}
+		}
+		stack = append(stack, node.Content...)
+		if node.Alias != nil {
+			stack = append(stack, node.Alias)
+		}
+	}
+	return nil
+}
+
 // normalizeImplicitMaps preserves the package's established convenience that
 // a bare mapping value (`key:`) behaves as an empty mapping. Restrict the
 // coercion to implicit nulls inside ordinary maps: explicit !!null values and
@@ -51,8 +81,8 @@ func normalizeImplicitMaps(doc *yaml.Node, st *docState) {
 	if doc == nil || st == nil || doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
 		return
 	}
-	var walk func(*yaml.Node, []ptrToken)
-	walk = func(node *yaml.Node, path []ptrToken) {
+	var walk func(*yaml.Node, []ptrToken, bool)
+	walk = func(node *yaml.Node, path []ptrToken, logicalPathActive bool) {
 		if node == nil {
 			return
 		}
@@ -66,8 +96,30 @@ func normalizeImplicitMaps(doc *yaml.Node, st *docState) {
 				if key == nil || key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
 					continue
 				}
+				// The ordered shadow uses last-key-wins lookup. Once traversal enters
+				// an earlier duplicate, no descendant path can identify that shadowed
+				// subtree: updating it would instead mutate the corresponding path in
+				// the retained later duplicate.
+				winningOccurrence := true
+				for later := i + 2; later+1 < len(node.Content); later += 2 {
+					if isStringMappingKey(node.Content[later], key.Value) {
+						winningOccurrence = false
+						break
+					}
+				}
+				childPathActive := logicalPathActive && winningOccurrence
+				fullPath := append(append([]ptrToken(nil), path...), ptrToken{key: key.Value})
 				if value.Kind == yaml.ScalarNode && value.Tag == "!!null" && value.Value == "" &&
 					value.Anchor == "" && !scalarHasExplicitTag(st.original, st.lineOffsets, value) {
+					if childPathActive && node.Style&yaml.FlowStyle != 0 {
+						// A flow child has no independent block-style source bound. Mark the
+						// normalization as a whole-node replacement so Marshal can promote
+						// it to a safe live-AST ancestor, retaining source-only scalar
+						// spellings and collection presentation along the way.
+						segments := tokenPathSegments(fullPath)
+						recordNodeReplacementIntentLocked(st, segments, value, yamlNodeSignature{kind: yaml.MappingNode, tag: "!!map", exists: true})
+						markAutomaticNormalizationIntentLocked(st, segments)
+					}
 					replacement := &yaml.Node{
 						Kind:        yaml.MappingNode,
 						Tag:         "!!map",
@@ -78,21 +130,23 @@ func normalizeImplicitMaps(doc *yaml.Node, st *docState) {
 						Column:      value.Column,
 					}
 					node.Content[i+1] = replacement
-					fullPath := append(append([]ptrToken(nil), path...), ptrToken{key: key.Value})
-					if updated, err := setOrderedAtPath(st.ordered, fullPath, gyaml.MapSlice{}); err == nil {
-						st.ordered = updated
+					if childPathActive {
+						if updated, err := setOrderedAtPath(st.ordered, fullPath, gyaml.MapSlice{}); err == nil {
+							st.ordered = updated
+						}
 					}
 					continue
 				}
-				walk(value, append(path, ptrToken{key: key.Value}))
+				walk(value, fullPath, childPathActive)
 			}
 		case yaml.SequenceNode:
 			for index, child := range node.Content {
-				walk(child, append(path, ptrToken{isIdx: true, index: index}))
+				childPath := append(append([]ptrToken(nil), path...), ptrToken{isIdx: true, index: index})
+				walk(child, childPath, logicalPathActive)
 			}
 		}
 	}
-	walk(doc.Content[0], nil)
+	walk(doc.Content[0], nil, true)
 }
 
 // Parse reads YAML data and returns a yaml.Node, creating a minimal mapping document if empty.
@@ -120,29 +174,33 @@ func Parse(data []byte) (*yaml.Node, error) {
 			doc = &tmp
 		}
 	}
+	if err := validateParsedMappingKeys(doc); err != nil {
+		return nil, fmt.Errorf("yamledit: failed to parse YAML: %w", err)
+	}
 
 	// Build shadow state using goccy/go-yaml (to preserve comments and ordered map for fallback)
 	st := &docState{
-		doc:                weak.Make(doc),
-		comments:           gyaml.CommentMap{},
-		ordered:            gyaml.MapSlice{},
-		subPathByHN:        map[weak.Pointer[yaml.Node]][]string{},
-		indent:             2,
-		indentSeq:          true,
-		original:           append([]byte(nil), data...),
-		originalRootEmpty:  len(data) > 0 && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0,
-		originalTriviaOnly: len(data) > 0 && isYAMLTriviaOnly(data),
-		lineOffsets:        buildLineOffsets(data),
-		mapIndex:           map[string]*mapInfo{},
-		valueOccByPathKey:  map[string][]valueOcc{},
-		boundsByPathKey:    map[string][]kvBounds{}, // Initialize new map
-		unsafePathKeys:     map[string]struct{}{},
-		opaquePathKeys:     map[string]struct{}{},
-		seqIndex:           map[string]*seqInfo{},
-		forceScalarRewrite: map[string]struct{}{},
-		forceScalarTags:    map[string]string{},
-		nodeRewriteIntents: map[string]nodeRewriteIntent{},
-		toDelete:           map[string]struct{}{},
+		doc:                     weak.Make(doc),
+		comments:                gyaml.CommentMap{},
+		ordered:                 gyaml.MapSlice{},
+		subPathByHN:             map[weak.Pointer[yaml.Node]][]string{},
+		indent:                  2,
+		indentSeq:               true,
+		original:                append([]byte(nil), data...),
+		originalRootEmpty:       len(data) > 0 && doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 && doc.Content[0].Kind == yaml.MappingNode && len(doc.Content[0].Content) == 0,
+		originalTriviaOnly:      len(data) > 0 && isYAMLTriviaOnly(data),
+		lineOffsets:             buildLineOffsets(data),
+		mapIndex:                map[string]*mapInfo{},
+		valueOccByPathKey:       map[string][]valueOcc{},
+		boundsByPathKey:         map[string][]kvBounds{}, // Initialize new map
+		unsafePathKeys:          map[string]struct{}{},
+		opaquePathKeys:          map[string]struct{}{},
+		nonReproduciblePathKeys: map[string]struct{}{},
+		seqIndex:                map[string]*seqInfo{},
+		forceScalarRewrite:      map[string]struct{}{},
+		forceScalarTags:         map[string]string{},
+		nodeRewriteIntents:      map[string]nodeRewriteIntent{},
+		toDelete:                map[string]struct{}{},
 	}
 	if st.originalRootEmpty {
 		root := doc.Content[0]
@@ -164,6 +222,16 @@ func Parse(data []byte) (*yaml.Node, error) {
 	if len(data) > 0 {
 		shadowData := bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
 		if err := gyaml.UnmarshalWithOptions(shadowData, &st.ordered, gyaml.UseOrderedMap(), gyaml.CommentToMap(st.comments)); err == nil {
+			// Both parsers accept a few ambiguous YAML spellings while assigning
+			// them different structures. The public yaml.Node returned above is the
+			// semantic authority, so never retain a successfully decoded goccy
+			// shadow when it disagrees with yaml.v3 (for example `A: {0:}`).
+			// Otherwise a no-op Marshal can validate or edit against the wrong key.
+			if astValue, astErr := yamlNodeToOrderedValue(doc.Content[0]); astErr == nil {
+				if astOrdered, ok := astValue.(gyaml.MapSlice); ok && !logicalEqualOrdered(st.ordered, astOrdered) {
+					st.ordered = astOrdered
+				}
+			}
 			ind, seq := detectIndentAndSequence(data)
 			st.indent, st.indentSeq = ind, seq
 		} else {
@@ -210,6 +278,7 @@ func Parse(data []byte) (*yaml.Node, error) {
 	// to patch ONLY the changed key (e.g. groupId) without re-encoding sibling block scalars.
 	if len(data) > 0 {
 		st.boundsByPathKey, st.unsafePathKeys, st.opaquePathKeys = indexBoundsByPathKeyDeep(st.original, doc)
+		st.nonReproduciblePathKeys = indexNonReproduciblePaths(st.original, doc)
 	}
 
 	register(doc, st)

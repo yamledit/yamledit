@@ -26,6 +26,7 @@ func TestSetValueUsesTheSameScalarTypeAtEveryDepth(t *testing.T) {
 		{name: "uint16", value: uint16(16), wantTag: "!!int", wantValue: "16"},
 		{name: "uint32", value: uint32(32), wantTag: "!!int", wantValue: "32"},
 		{name: "uint64", value: uint64(math.MaxUint64), wantTag: "!!int", wantValue: "18446744073709551615"},
+		{name: "uintptr", value: uintptr(64), wantTag: "!!int", wantValue: "64"},
 		{name: "integral float32", value: float32(4), wantTag: "!!float", wantValue: "4.0"},
 		{name: "integral float64", value: float64(4), wantTag: "!!float", wantValue: "4.0"},
 		{name: "negative zero float", value: math.Copysign(0, -1), wantTag: "!!float", wantValue: "-0.0"},
@@ -104,6 +105,36 @@ func TestSetValueWritesEmptyCollectionsAndReplacesMappings(t *testing.T) {
 		for i := 0; i+1 < len(mapping.Content); i += 2 {
 			require.NotEqual(t, key, mapping.Content[i].Value, "output:\n%s", out)
 		}
+	}
+}
+
+func TestSetValueWholeMappingReplacementHonorsSortedOrder(t *testing.T) {
+	doc, err := Parse([]byte("resources:\n  requests:\n    memory: old\n    cpu: old\n  limits:\n    memory: old\n    cpu: old\ntail: yes\n"))
+	require.NoError(t, err)
+
+	SetValue(doc.Content[0], "resources", map[string]any{
+		"requests": map[string]any{"memory": "512Mi", "cpu": "500m"},
+		"limits":   map[string]any{"memory": "1Gi", "cpu": "2"},
+	}, SetValueOptions{SortKeys: true})
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	var round yaml.Node
+	require.NoError(t, yaml.Unmarshal(out, &round), "output:\n%s", out)
+	root := round.Content[0]
+	require.Equal(t, "resources", root.Content[0].Value, "replacement keeps its root position; output:\n%s", out)
+	require.Equal(t, "tail", root.Content[2].Value, "output:\n%s", out)
+	resources := root.Content[1]
+	require.Equal(t, []string{"limits", "requests"}, []string{
+		resources.Content[0].Value,
+		resources.Content[2].Value,
+	}, "SortKeys order must govern the entire replacement; output:\n%s", out)
+	for index := 1; index < len(resources.Content); index += 2 {
+		child := resources.Content[index]
+		require.Equal(t, []string{"cpu", "memory"}, []string{
+			child.Content[0].Value,
+			child.Content[2].Value,
+		}, "nested replacement order; output:\n%s", out)
 	}
 }
 
@@ -207,6 +238,24 @@ func TestSetValueDoesNotPanicOnNilMappingValueNode(t *testing.T) {
 	require.Equal(t, "18446744073709551615", value.Value)
 }
 
+func TestSetValueMovesScalarInlineCommentToBlockCollectionKey(t *testing.T) {
+	doc, err := Parse([]byte("target: old # keep\ntail: yes\n"))
+	require.NoError(t, err)
+	root := doc.Content[0]
+
+	SetValue(root, "target", map[string]any{"nested": []any{1}}, SetValueOptions{SortKeys: true})
+	require.Equal(t, "# keep", root.Content[0].LineComment)
+	require.Empty(t, root.Content[1].LineComment)
+
+	out, err := Marshal(doc)
+	require.NoError(t, err)
+	require.Contains(t, string(out), "target: # keep\n")
+	var reparsed yaml.Node
+	require.NoError(t, yaml.Unmarshal(out, &reparsed), "output:\n%s", out)
+	require.Equal(t, "# keep", reparsed.Content[0].Content[0].LineComment)
+	require.Empty(t, reparsed.Content[0].Content[1].LineComment)
+}
+
 func TestSetValueCollectionReplacementPreservesAnchoredNodeAndExternalAliases(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -259,6 +308,7 @@ func TestSetValueCollectionReplacementPreservesAnchoredNodeAndExternalAliases(t 
 			originalAlias := mappingValueForStringKey(t, root, "alias")
 			require.Equal(t, yaml.AliasNode, originalAlias.Kind)
 			require.Same(t, originalValue, originalAlias.Alias)
+			originalKind := originalValue.Kind
 			originalLineComment := originalValue.LineComment
 
 			SetValue(root, "value", tt.value, SetValueOptions{SortKeys: true})
@@ -267,7 +317,12 @@ func TestSetValueCollectionReplacementPreservesAnchoredNodeAndExternalAliases(t 
 			require.Same(t, originalValue, liveValue, "the anchor node identity must remain attached")
 			require.Same(t, liveValue, originalAlias.Alias, "the external alias must follow the replacement")
 			require.Equal(t, "shared", liveValue.Anchor)
-			require.Equal(t, originalLineComment, liveValue.LineComment)
+			if originalKind == yaml.ScalarNode && tt.wantContent > 0 {
+				require.Equal(t, originalLineComment, root.Content[0].LineComment)
+				require.Empty(t, liveValue.LineComment)
+			} else {
+				require.Equal(t, originalLineComment, liveValue.LineComment)
+			}
 			require.Equal(t, tt.wantKind, liveValue.Kind)
 			require.Equal(t, tt.wantTag, liveValue.Tag)
 			require.Len(t, liveValue.Content, tt.wantContent)
